@@ -1,0 +1,48 @@
+[workspace]
+name = "rlinf"
+version = "0.2.0.dev2"
+authors = ["RLinf Contributors"]
+description = "Reinforcement Learning Infrastructure for Embodied and Agentic AI"
+channels = ["pytorch", "nvidia", "conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.11.*"
+uv = "*"
+
+[target.linux-64.dependencies]
+cuda-toolkit = ">=12.1"
+
+[tasks]
+# Setup task - creates venv and syncs dependencies
+setup = "bash requirements/install.sh embodied --env maniskill_libero --install-rlinf"
+setup-openvla = "bash requirements/install.sh embodied --model openvla --env maniskill_libero --install-rlinf"
+setup-openvla-oft = "bash requirements/install.sh embodied --model openvla-oft --env maniskill_libero --install-rlinf"
+setup-openpi = "bash requirements/install.sh embodied --model openpi --env maniskill_libero --install-rlinf"
+setup-gr00t = "bash requirements/install.sh embodied --model gr00t --env maniskill_libero --install-rlinf"
+setup-dexbotic = "bash requirements/install.sh embodied --model dexbotic --env maniskill_libero --install-rlinf"
+setup-agentic = "bash requirements/install.sh agentic --install-rlinf"
+setup-docs = "bash requirements/install.sh docs --install-rlinf"
+
+# Development tasks
+install-embodied = "uv sync --extra embodied --active"
+install-agentic-sglang = "uv sync --extra agentic-sglang --inexact --active"
+install-agentic-vllm = "uv sync --extra agentic-vllm --active"
+install-franka = "uv sync --extra franka --active"
+install-all-extras = "uv sync --extra embodied --extra agentic-sglang --extra agentic-vllm --extra franka"
+
+# Test tasks
+test = "pytest tests/unit_tests"
+test-embodied = "pytest tests/e2e_tests/embodied"
+test-agent = "pytest tests/e2e_tests/agent"
+test-reasoning = "pytest tests/e2e_tests/reasoning"
+
+# Lint tasks
+lint = "ruff check rlinf/"
+format = "ruff format rlinf/"
+
+# Pre-commit
+pre-commit = "pre-commit run --all-files"
+
+[activation]
+env = { RLINF = "1" }
