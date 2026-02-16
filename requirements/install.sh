@@ -17,7 +17,7 @@ GITHUB_PREFIX=""
 NO_ROOT=0
 NO_INSTALL_RLINF_CMD="--no-install-project"
 SUPPORTED_TARGETS=("embodied" "agentic" "docs")
-SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "gr00t" "dexbotic")
+SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "gr00t" "dexbotic" "xvla")
 SUPPORTED_ENVS=("behavior" "maniskill_libero" "metaworld" "calvin" "isaaclab" "robocasa" "franka" "frankasim" "robotwin" "habitat" "opensora" "wan")
 
 #=======================Utility Functions=======================
@@ -533,6 +533,37 @@ install_dexbotic_model() {
     uv pip uninstall pynvml || true
 }
 
+install_xvla_model() {
+    # XVLA requires lerobot[xvla] which needs specific transformer versions
+    case "$ENV_NAME" in
+        maniskill_libero)
+            create_and_sync_venv
+            install_common_embodied_deps
+            install_maniskill_libero_env
+            ;;
+        behavior)
+            PYTHON_VERSION="3.10"
+            create_and_sync_venv
+            install_common_embodied_deps
+            install_behavior_env
+            ;;
+        *)
+            # For other environments, just create venv with basic deps
+            create_and_sync_venv
+            install_common_embodied_deps
+            ;;
+    esac
+    
+    # Install LeRobot with XVLA support
+    # This will install transformers>=4.57.1,<5.0.0 which is required
+    uv pip install "lerobot[xvla]"
+    
+    # Install flash attention for better performance
+    install_flash_attn
+    
+    uv pip uninstall pynvml || true
+}
+
 install_env_only() {
     create_and_sync_venv
     SKIP_ROS=${SKIP_ROS:-0}
@@ -857,6 +888,9 @@ main() {
                     ;;
                 dexbotic)
                     install_dexbotic_model
+                    ;;
+                xvla)
+                    install_xvla_model
                     ;;
                 "")
                     install_env_only

@@ -1,0 +1,134 @@
+# Copyright 2025 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# XVLA SFT Configuration
+# 
+# This config demonstrates supervised fine-tuning for LeRobot's XVLA model.
+# XVLA is a soft-prompted VLA model using flow-matching for action prediction.
+#
+# Required dependencies:
+#   pip install "lerobot[xvla]"
+#
+# Usage:
+#   python examples/sft/train_embodied_sft.py --config-name xvla_sft
+
+defaults:
+  - model/xvla@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: 0-0
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "test_xvla"
+    logger_backends: ["tensorboard"]  # wandb, swanlab
+
+  max_epochs: 30000
+  max_steps: -1
+  val_check_interval: -1
+  save_interval: 2000
+
+data:
+  # LeRobot dataset to use
+  data_path: "lerobot/xvla"  # or specify custom dataset path
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 4
+  global_batch_size: 128
+  seed: 0
+
+  # Model configuration - must match XVLA requirements
+  model:
+    # Model type is set by default: xvla
+    precision: null  # bfloat16, float16, or null (float32)
+    
+    # Path to pretrained XVLA model (HuggingFace or local)
+    model_path: "lerobot/xvla-base"
+    
+    # Action configuration
+    action_dim: 20  # XVLA-base uses 20D actions by default
+    num_action_chunks: 1
+    
+    # Domain ID for multi-domain training
+    # Available domains: Bridge(0), RT1(1), Calvin(2), LIBERO(3), etc.
+    domain_id: 0
+    
+    # Action space mode
+    # "auto": automatically detect from dataset (recommended)
+    # "ee6d": end-effector with 6D rotation (20D)
+    # "joint": joint-space control (14D)
+    action_mode: "auto"
+    
+    # Whether to add value head for RL training
+    add_value_head: False
+    
+    # LeRobot dataset configuration
+    dataset_name: "lerobot/xvla"
+    
+    # Trust remote code (required for XVLA)
+    trust_remote_code: True
+    
+    # Hidden size (auto-detected from config if not specified)
+    hidden_size: 1024
+    
+    # LoRA configuration
+    is_lora: False
+
+  optim:
+    lr: 2.5e-5
+    value_lr: 1.55e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    warmup_style: "cosine"
+    lr_warmup_steps: 1000
+    total_training_steps: 30000  # for lr scheduler cosine decay
+
+  # Override the default values in training_backend/fsdp
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "full_shard"
+    use_orig_params: True  # Required for XVLA with parameter groups
+    gradient_checkpointing: False
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

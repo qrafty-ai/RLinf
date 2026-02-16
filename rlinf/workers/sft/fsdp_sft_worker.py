@@ -74,6 +74,44 @@ class FSDPSftWorker(FSDPModelManager, Worker):
                 config, framework="pytorch", shuffle=True
             )
             return data_loader, data_loader.data_config()
+        elif SupportedModel(self.cfg.actor.model.model_type) in [SupportedModel.XVLA]:
+            # Import LeRobot dataset components
+            try:
+                from lerobot.datasets.lerobot_dataset import LeRobotDataset
+                from lerobot.policies.factory import make_pre_post_processors
+            except ImportError:
+                raise ImportError(
+                    "LeRobot is not installed. Install with: pip install 'lerobot[xvla]'"
+                )
+
+            # Get dataset configuration
+            dataset_name = self.cfg.actor.model.get("dataset_name", "lerobot/xvla")
+            batch_size = self.cfg.actor.micro_batch_size * self._world_size
+
+            # Create LeRobot dataset
+            dataset = LeRobotDataset(
+                dataset_name=dataset_name,
+                batch_size=batch_size,
+                num_workers=self.cfg.actor.get("num_workers", 4),
+                shuffle=True,
+            )
+
+            # Get pre/post processors for XVLA
+            model_config = None
+            try:
+                from lerobot.policies.xvla.configuration_xvla import XVLAConfig
+
+                model_config = XVLAConfig.from_pretrained(
+                    self.cfg.actor.model.model_path,
+                    trust_remote_code=self.cfg.actor.model.get(
+                        "trust_remote_code", True
+                    ),
+                )
+            except Exception:
+                pass
+
+            # Return dataset and config
+            return dataset, {"preprocessors": None, "postprocessors": None}
         else:
             raise KeyError(
                 f"not support such model type {self.cfg.actor.model.model_type} for SFT right now."
@@ -114,11 +152,11 @@ class FSDPSftWorker(FSDPModelManager, Worker):
 
                 register_pytree_dataclasses(observation)
                 observation = _pytree.tree_map(
-                    lambda x: torch.as_tensor(x, device=self.device)
-                    .contiguous()
-                    .clone()
-                    if x is not None
-                    else x,
+                    lambda x: (
+                        torch.as_tensor(x, device=self.device).contiguous().clone()
+                        if x is not None
+                        else x
+                    ),
                     observation,
                 )
                 actions = actions.to(torch.float32)
