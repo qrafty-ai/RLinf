@@ -3,8 +3,11 @@ name = "rlinf"
 version = "0.2.0.dev2"
 authors = ["RLinf Contributors"]
 description = "Reinforcement Learning Infrastructure for Embodied and Agentic AI"
-channels = ["pytorch", "nvidia", "conda-forge"]
+channels = ["https://conda.anaconda.org/nvidia", "conda-forge"]
 platforms = ["linux-64"]
+
+[system-requirements]
+cuda = "12.0"
 
 [dependencies]
 python = "3.11.*"
@@ -12,9 +15,9 @@ uv = "*"
 sysroot_linux-64 = { version = "2.39.*", channel = "conda-forge" }
 kernel-headers_linux-64 = { version = "6.12.*", channel = "conda-forge" }
 evdev = { version = ">=1.9.2,<2", channel = "conda-forge" }
-
-[target.linux-64.dependencies]
-cuda-toolkit = ">=12.1"
+ffmpeg = ">=4.3,<5"
+cuda-toolkit = { version = "12.6.*", channel = "nvidia" }
+cuda-version = "12.6.*"
 
 [tasks]
 # Setup task - creates venv and syncs dependencies
