@@ -1,0 +1,13 @@
+model_type: "xvla"
+model_path: "lerobot/xvla-base"
+precision: null
+action_dim: 20
+num_action_chunks: 1
+domain_id: 0
+action_mode: "auto"
+add_value_head: false
+dataset_name: "lerobot/xvla"
+trust_remote_code: true
+hidden_size: 1024
+is_lora: false
+lora_rank: 32

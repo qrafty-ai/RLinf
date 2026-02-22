@@ -35,12 +35,10 @@ dependencies = [
     "torch>=2.5.0,<=2.9.0",
     "hydra-core",
     "numpy",
-
     # Data processing
     "datasets",
     "torchdata",
     "scipy",
-
     # Utilities
     "accelerate",
     "debugpy",
@@ -56,14 +54,14 @@ dependencies = [
     "liger_kernel; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "uv",
     "pip",
-    "huggingface_hub",
+    "huggingface-hub",
     "icmplib",
     "pyrealsense2; sys_platform == 'linux' and platform_machine == 'x86_64'",
-
     # Logging
     "wandb",
     "swanlab>=0.6.11",
     "tensorboard",
+    "peft>=0.17",
 ]
 
 [project.urls]
@@ -74,7 +72,7 @@ Documentation = "https://rlinf.readthedocs.io/"
 
 [project.optional-dependencies]
 agentic-sglang = [
-    "sglang[all]==0.4.6.post5",
+    "sglang[all]>=0.4.6.post5",
     "torch-memory-saver",
     "numpy==2.2",
     "transformers==4.51.1",
@@ -103,7 +101,7 @@ agentic-vllm = [
     "mcp",
 ]
 embodied = [
-    "transformers<=4.57.6",
+    "transformers",
     "peft",
     "timm",
     "imageio[ffmpeg]",
@@ -114,7 +112,7 @@ franka = [
     "pyyaml",
     "rospkg",
     "empy==3.3.4",
-    "gymnasium==0.29.1",
+    "gymnasium>=0.29.1",
     "pyrealsense2",
     "pyquaternion",
     "opencv-python",
@@ -144,7 +142,8 @@ override-dependencies = [
     "tensorflow-addons==0.23.0",
     "setuptools>=69.5.1,<75.9",
     "datasets==3.6.0",
-    "peft==0.11.1",
+    "peft>=0.17",
+    "transformers==4.51.1",
 ]
 
 [tool.setuptools]
@@ -192,3 +191,11 @@ skip-magic-trailing-comma = false
 line-ending = "auto"
 docstring-code-format = true
 docstring-code-line-length = "dynamic"
+
+[dependency-groups]
+dev = [
+    "ipython>=8.38.0",
+]
+xvla = [
+    "lerobot[xvla]>0.4.2",
+]
