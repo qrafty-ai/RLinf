@@ -38,19 +38,24 @@ def get_model_config_and_input_processor(cfg: DictConfig):
     """
     # Try to import LeRobot components
     try:
+        from lerobot.configs.policies import PreTrainedConfig
         from lerobot.policies.xvla.configuration_xvla import XVLAConfig
         from lerobot.policies.factory import make_pre_post_processors
 
         # Load XVLA config from pretrained model
-        model_config = XVLAConfig.from_pretrained(
-            cfg.model_path,
-            trust_remote_code=cfg.trust_remote_code,
-        )
+        try:
+            model_config = XVLAConfig.from_pretrained(
+                cfg.model_path,
+                trust_remote_code=cfg.trust_remote_code,
+            )
+        except Exception:
+            model_config = PreTrainedConfig.from_pretrained(cfg.model_path)
 
         # Create pre/post processors for XVLA
         # These handle image normalization and domain_id injection
         preprocessors, postprocessors = make_pre_post_processors(
-            model_config, cfg.dataset_name if hasattr(cfg, "dataset_name") else None
+            model_config,
+            pretrained_path=cfg.model_path if hasattr(cfg, "model_path") else None,
         )
 
         # Return config and processors
@@ -77,6 +82,7 @@ def get_model(cfg: DictConfig, torch_dtype: torch.dtype = torch.bfloat16):
         XVLA model instance
     """
     try:
+        from lerobot.configs.policies import PreTrainedConfig
         from lerobot.policies.xvla.configuration_xvla import XVLAConfig
         from lerobot.policies.xvla.modeling_xvla import XVLAPolicy
     except ImportError as e:
@@ -85,18 +91,21 @@ def get_model(cfg: DictConfig, torch_dtype: torch.dtype = torch.bfloat16):
         ) from e
 
     # Load model config
-    actor_model_config = XVLAConfig.from_pretrained(
-        cfg.model_path,
-        trust_remote_code=cfg.trust_remote_code,
-    )
+    try:
+        actor_model_config = XVLAConfig.from_pretrained(
+            cfg.model_path,
+            trust_remote_code=cfg.trust_remote_code,
+        )
+    except Exception:
+        actor_model_config = PreTrainedConfig.from_pretrained(cfg.model_path)
 
     # Override config with user-specified values
-    if hasattr(cfg, "action_dim"):
-        actor_model_config.action_dim = cfg.action_dim
-    if hasattr(cfg, "action_mode"):
-        actor_model_config.action_mode = cfg.action_mode
-    if hasattr(cfg, "domain_id"):
-        actor_model_config.domain_id = cfg.domain_id
+    if hasattr(cfg, "action_dim") and hasattr(actor_model_config, "action_dim"):
+        setattr(actor_model_config, "action_dim", cfg.action_dim)
+    if hasattr(cfg, "action_mode") and hasattr(actor_model_config, "action_mode"):
+        setattr(actor_model_config, "action_mode", cfg.action_mode)
+    if hasattr(cfg, "domain_id") and hasattr(actor_model_config, "domain_id"):
+        setattr(actor_model_config, "domain_id", cfg.domain_id)
 
     # Import the RLinf wrapper
     from rlinf.models.embodiment.xvla.xvla_action_model import (
@@ -104,7 +113,7 @@ def get_model(cfg: DictConfig, torch_dtype: torch.dtype = torch.bfloat16):
     )
 
     # Determine hidden size from config or use default
-    hidden_size = cfg.get("hidden_size", actor_model_config.hidden_size)
+    hidden_size = cfg.get("hidden_size", getattr(actor_model_config, "hidden_size", 1024))
 
     # Load the base XVLAPolicy
     model = XVLAPolicy.from_pretrained(
@@ -129,8 +138,5 @@ def get_model(cfg: DictConfig, torch_dtype: torch.dtype = torch.bfloat16):
     # This is needed because XVLAForRLActionPrediction wraps XVLAPolicy
     xvla_model.model = model.model if hasattr(model, "model") else model
     xvla_model.config = model.config if hasattr(model, "config") else actor_model_config
-
-    # Move to dtype
-    xvla_model.to(torch_dtype)
 
     return xvla_model

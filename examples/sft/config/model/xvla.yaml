@@ -6,6 +6,7 @@ num_action_chunks: 1
 domain_id: 0
 action_mode: "auto"
 add_value_head: false
+repo_id: "lerobot/xvla"
 dataset_name: "lerobot/xvla"
 trust_remote_code: true
 hidden_size: 1024

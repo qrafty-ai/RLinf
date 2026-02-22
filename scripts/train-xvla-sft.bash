@@ -18,5 +18,5 @@ PYTHON_BIN="$REPO_ROOT/.venv/bin/python"
   actor.global_batch_size=8 \
   actor.model.domain_id=3 \
   actor.model.model_path="lerobot/xvla-base" \
-  actor.model.dataset_name="lerobot/libero_10_image" \
+  actor.model.repo_id="lerobot/libero_10" \
   data.data_path="$HOME/.cache/huggingface/lerobot"

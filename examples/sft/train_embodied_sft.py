@@ -32,7 +32,11 @@ mp.set_start_method("spawn", force=True)
     version_base="1.1", config_path="config", config_name="maniskill_ppo_openvlaoft"
 )
 def main(cfg) -> None:
-    os.environ["HF_LEROBOT_HOME"] = cfg.data.data_path
+    data_path = cfg.data.data_path
+    if isinstance(data_path, str):
+        expanded_data_path = os.path.expanduser(data_path)
+        if data_path.startswith(("~", "/", ".")) or os.path.isdir(expanded_data_path):
+            os.environ["HF_LEROBOT_HOME"] = expanded_data_path
 
     cfg = validate_cfg(cfg)
     print(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))

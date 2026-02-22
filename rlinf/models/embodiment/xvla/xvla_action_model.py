@@ -33,7 +33,7 @@ try:
     from lerobot.policies.xvla.modeling_xvla import XVLAPolicy
     from lerobot.policies.xvla.configuration_xvla import XVLAConfig
     from lerobot.policies.factory import make_pre_post_processors
-    from lerobot.policies.xvla.action_hub import get_action_space
+    from lerobot.policies.xvla.action_hub import build_action_space
 
     LEROBOT_AVAILABLE = True
 except ImportError:
@@ -128,8 +128,12 @@ class XVLAForRLActionPrediction(
                     bias_last=False,
                 )
 
-            # Get action space info
-            self._action_space = get_action_space(action_mode)
+            if action_mode == "auto":
+                self._action_space = build_action_space(
+                    "auto", real_dim=action_dim, max_dim=action_dim
+                )
+            else:
+                self._action_space = build_action_space(action_mode)
         else:
             # Placeholder initialization for when LeRobot is not available
             self.value_head = None
@@ -256,40 +260,36 @@ class XVLAForRLActionPrediction(
 
         observation = data.get("observation", {})
         actions = data.get("actions")
+        from lerobot.utils.constants import ACTION, OBS_LANGUAGE_TOKENS
 
-        # Extract inputs from observation
-        pixel_values = observation.get("pixel_values")
-        input_ids = observation.get("input_ids")
-        attention_mask = observation.get("attention_mask")
-        domain_ids = observation.get("domain_ids")
+        xvla_batch: dict[str, torch.Tensor] = {
+            key: value
+            for key, value in observation.items()
+            if isinstance(key, str) and key.startswith("observation.") and isinstance(value, torch.Tensor)
+        }
 
-        # Default domain_id
-        if domain_ids is None:
-            batch_size = (
-                pixel_values.shape[0] if pixel_values is not None else actions.shape[0]
-            )
-            domain_ids = torch.full(
-                (batch_size,), self.domain_id, dtype=torch.long, device=actions.device
-            )
+        if "observation.images.image" not in xvla_batch and isinstance(
+            observation.get("pixel_values"), torch.Tensor
+        ):
+            xvla_batch["observation.images.image"] = observation["pixel_values"]
 
-        # Forward pass with flow-matching loss computation
-        outputs = self.forward_flow_matching(
-            pixel_values=pixel_values,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            domain_ids=domain_ids,
-            target_actions=actions,
-            compute_loss=True,
-        )
+        if OBS_LANGUAGE_TOKENS not in xvla_batch:
+            if isinstance(observation.get("input_ids"), torch.Tensor):
+                input_ids = observation["input_ids"].to(dtype=torch.long)
+            else:
+                batch_size = actions.shape[0]
+                input_ids = torch.zeros((batch_size, 1), dtype=torch.long, device=actions.device)
+            if input_ids.ndim == 1:
+                input_ids = input_ids.unsqueeze(0)
+            xvla_batch[OBS_LANGUAGE_TOKENS] = input_ids
 
-        # Return loss for SFT training
-        if "loss" in outputs:
-            return {"loss": outputs["loss"]}
-        else:
-            # Fallback: compute MSE loss between predicted and target actions
-            predicted_actions = outputs["actions"]
-            loss = torch.nn.functional.mse_loss(predicted_actions, actions)
-            return {"loss": loss}
+        if isinstance(observation.get("domain_ids"), torch.Tensor):
+            xvla_batch["domain_id"] = observation["domain_ids"].to(dtype=torch.long)
+
+        xvla_batch[ACTION] = actions
+
+        loss, _ = XVLAPolicy.forward(self, xvla_batch)
+        return {"loss": loss}
 
     @torch.no_grad()
     def predict_action_batch(
@@ -407,6 +407,23 @@ class XVLAForRLActionPrediction(
         # Add loss computation if requested
         if compute_loss and target_actions is not None:
             predicted_actions = outputs["actions"]
+            while target_actions.ndim < predicted_actions.ndim:
+                target_actions = target_actions.unsqueeze(1)
+            while target_actions.ndim > predicted_actions.ndim and target_actions.shape[1] == 1:
+                target_actions = target_actions.squeeze(1)
+            if (
+                target_actions.shape[:-1] == predicted_actions.shape[:-1]
+                and target_actions.shape[-1] != predicted_actions.shape[-1]
+            ):
+                if target_actions.shape[-1] < predicted_actions.shape[-1]:
+                    pad_size = predicted_actions.shape[-1] - target_actions.shape[-1]
+                    target_actions = torch.nn.functional.pad(target_actions, (0, pad_size))
+                else:
+                    target_actions = target_actions[..., : predicted_actions.shape[-1]]
+            target_actions = target_actions.to(
+                device=predicted_actions.device,
+                dtype=predicted_actions.dtype,
+            )
             # Flow-matching uses MSE loss
             loss = torch.nn.functional.mse_loss(predicted_actions, target_actions)
             outputs["loss"] = loss

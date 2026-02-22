@@ -13,11 +13,13 @@
 # limitations under the License.
 
 import os
+from typing import Any
 
 import numpy as np
 import torch
 from omegaconf import DictConfig
 from torch.utils import _pytree
+from torch.utils.data import DataLoader
 
 import rlinf.algorithms  # noqa: F401
 from rlinf.config import SupportedModel
@@ -59,6 +61,85 @@ class FSDPSftWorker(FSDPModelManager, Worker):
             return model
         return super().model_provider_func()
 
+    def _resolve_lerobot_dataset_args(self) -> tuple[str, str | None]:
+        data_cfg = self.cfg.get("data", {})
+        data_path = data_cfg.get("data_path") if data_cfg is not None else None
+
+        dataset_repo_id = self.cfg.actor.model.get("repo_id")
+        if dataset_repo_id is None:
+            dataset_repo_id = self.cfg.actor.model.get("dataset_name")
+        if dataset_repo_id is None:
+            dataset_repo_id = "lerobot/xvla"
+
+        dataset_root = None
+        if isinstance(data_path, str):
+            expanded_path = os.path.expanduser(data_path)
+            if data_path.startswith(("~", "/", ".")) or os.path.isdir(expanded_path):
+                dataset_root = expanded_path
+
+        return str(dataset_repo_id), dataset_root
+
+    def _extract_sft_batch(
+        self, batch: Any
+    ) -> tuple[dict[str, Any], torch.Tensor]:
+        if isinstance(batch, (list, tuple)) and len(batch) == 2:
+            return batch[0], batch[1]
+
+        if not isinstance(batch, dict):
+            raise TypeError(
+                f"Unsupported SFT batch type {type(batch)}. Expected tuple/list of (observation, action) or dict batch."
+            )
+
+        actions = batch.get("action")
+        if actions is None:
+            actions = batch.get("actions")
+        if actions is None:
+            raise KeyError(
+                f"Unable to find action tensor in LeRobot batch. Available keys: {sorted(batch.keys())}"
+            )
+
+        observation = {}
+        nested_observation = batch.get("observation")
+        if isinstance(nested_observation, dict):
+            observation.update(nested_observation)
+
+        for key, value in batch.items():
+            if isinstance(key, str) and key.startswith("observation."):
+                observation[key] = value
+
+        if "domain_ids" not in observation and "domain_id" in batch:
+            observation["domain_ids"] = batch["domain_id"]
+        if "domain_ids" not in observation:
+            observation["domain_ids"] = torch.full(
+                (actions.shape[0],),
+                int(self.cfg.actor.model.get("domain_id", 0)),
+                dtype=torch.long,
+            )
+
+        if "input_ids" not in observation and "observation.language.tokens" in observation:
+            observation["input_ids"] = observation["observation.language.tokens"]
+        if (
+            "attention_mask" not in observation
+            and "observation.language.attention_mask" in observation
+        ):
+            observation["attention_mask"] = observation[
+                "observation.language.attention_mask"
+            ]
+
+        if "pixel_values" not in observation:
+            if "observation.image" in observation:
+                observation["pixel_values"] = observation["observation.image"]
+            else:
+                image_keys = sorted(
+                    key
+                    for key in observation
+                    if isinstance(key, str) and key.startswith("observation.images.")
+                )
+                if image_keys:
+                    observation["pixel_values"] = observation[image_keys[0]]
+
+        return observation, actions
+
     def build_dataloader(self):
         if SupportedModel(self.cfg.actor.model.model_type) in [SupportedModel.OPENPI]:
             import openpi.training.data_loader as openpi_data_loader
@@ -78,40 +159,40 @@ class FSDPSftWorker(FSDPModelManager, Worker):
             # Import LeRobot dataset components
             try:
                 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-                from lerobot.policies.factory import make_pre_post_processors
             except ImportError:
                 raise ImportError(
                     "LeRobot is not installed. Install with: pip install 'lerobot[xvla]'"
                 )
 
             # Get dataset configuration
-            dataset_name = self.cfg.actor.model.get("dataset_name", "lerobot/xvla")
+            dataset_repo_id, dataset_root = self._resolve_lerobot_dataset_args()
             batch_size = self.cfg.actor.micro_batch_size * self._world_size
+            video_backend = self.cfg.actor.model.get("video_backend", "torchcodec")
 
             # Create LeRobot dataset
             dataset = LeRobotDataset(
-                dataset_name=dataset_name,
-                batch_size=batch_size,
-                num_workers=self.cfg.actor.get("num_workers", 4),
-                shuffle=True,
+                repo_id=dataset_repo_id,
+                root=dataset_root,
+                video_backend=video_backend,
             )
 
-            # Get pre/post processors for XVLA
-            model_config = None
-            try:
-                from lerobot.policies.xvla.configuration_xvla import XVLAConfig
-
-                model_config = XVLAConfig.from_pretrained(
-                    self.cfg.actor.model.model_path,
-                    trust_remote_code=self.cfg.actor.model.get(
-                        "trust_remote_code", True
-                    ),
-                )
-            except Exception:
-                pass
+            data_loader = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=self.cfg.actor.get("num_workers", 4),
+                pin_memory=torch.cuda.is_available(),
+                drop_last=True,
+            )
 
             # Return dataset and config
-            return dataset, {"preprocessors": None, "postprocessors": None}
+            return data_loader, {
+                "preprocessors": None,
+                "postprocessors": None,
+                "dataset_repo_id": dataset_repo_id,
+                "dataset_root": dataset_root,
+                "video_backend": video_backend,
+            }
         else:
             raise KeyError(
                 f"not support such model type {self.cfg.actor.model.model_type} for SFT right now."
@@ -148,18 +229,31 @@ class FSDPSftWorker(FSDPModelManager, Worker):
                     self.model,
                     is_last_micro_batch=(idx + 1) == self.gradient_accumulation,
                 )
-                observation, actions = next(self.data_iter)
+                observation, actions = self._extract_sft_batch(next(self.data_iter))
 
                 register_pytree_dataclasses(observation)
                 observation = _pytree.tree_map(
                     lambda x: (
                         torch.as_tensor(x, device=self.device).contiguous().clone()
                         if x is not None
+                        and isinstance(
+                            x,
+                            (
+                                torch.Tensor,
+                                np.ndarray,
+                                list,
+                                tuple,
+                                int,
+                                float,
+                                bool,
+                                np.number,
+                            ),
+                        )
                         else x
                     ),
                     observation,
                 )
-                actions = actions.to(torch.float32)
+                actions = torch.as_tensor(actions).to(torch.float32)
                 actions = actions.to(self.device)
 
                 with self.amp_context:
@@ -167,6 +261,15 @@ class FSDPSftWorker(FSDPModelManager, Worker):
                         forward_type=ForwardType.SFT,
                         data={"observation": observation, "actions": actions},
                     )
+                    if isinstance(losses, dict):
+                        if "loss" in losses:
+                            losses = losses["loss"]
+                        elif "losses" in losses:
+                            losses = losses["losses"]
+                        else:
+                            raise KeyError(
+                                f"SFT forward output dict missing loss key. Available keys: {sorted(losses.keys())}"
+                            )
                     if isinstance(losses, (list, tuple)):
                         losses = torch.stack(losses)
                     elif not isinstance(losses, torch.Tensor):

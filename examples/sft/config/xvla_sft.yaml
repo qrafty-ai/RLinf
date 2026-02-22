@@ -92,7 +92,7 @@ actor:
     # Whether to add value head for RL training
     add_value_head: False
     
-    # LeRobot dataset configuration
+    repo_id: "lerobot/xvla"
     dataset_name: "lerobot/xvla"
     
     # Trust remote code (required for XVLA)
