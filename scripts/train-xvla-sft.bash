@@ -8,6 +8,7 @@ export CUDA_VISIBLE_DEVICES=0
 export EMBODIED_PATH="$REPO_ROOT/examples/embodiment"
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 export RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:128"
 
 PYTHON_BIN="$REPO_ROOT/.venv/bin/python"
 
@@ -15,7 +16,7 @@ PYTHON_BIN="$REPO_ROOT/.venv/bin/python"
   --config-name xvla_sft \
   cluster.num_nodes=1 \
   actor.micro_batch_size=1 \
-  actor.global_batch_size=8 \
+  actor.global_batch_size=4 \
   actor.model.domain_id=3 \
   actor.model.model_path="lerobot/xvla-base" \
   actor.model.repo_id="lerobot/libero_10" \

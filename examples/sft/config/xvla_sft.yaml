@@ -46,7 +46,7 @@ runner:
     log_path: "../results"
     project_name: rlinf
     experiment_name: "test_xvla"
-    logger_backends: ["tensorboard"]  # wandb, swanlab
+    logger_backends: ["wandb"]  # wandb, swanlab
 
   max_epochs: 30000
   max_steps: -1
