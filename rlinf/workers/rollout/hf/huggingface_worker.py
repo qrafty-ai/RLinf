@@ -200,6 +200,7 @@ class MultiStepRolloutWorker(Worker):
 
         if SupportedModel(self.cfg.actor.model.model_type) in [
             SupportedModel.OPENPI,
+            SupportedModel.XVLA,
             SupportedModel.MLP_POLICY,
             SupportedModel.GR00T,
             SupportedModel.CNN_POLICY,
