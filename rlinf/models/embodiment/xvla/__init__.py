@@ -35,7 +35,7 @@ try:
     # Data config
     from rlinf.models.embodiment.xvla.dataconfig import get_xvla_config
 
-    def get_model(cfg) -> XVLAForRLActionPrediction:
+    def get_model(cfg, torch_dtype=None) -> XVLAForRLActionPrediction:
         """Factory function to instantiate XVLA model with Florence2 backbone.
         
         Args:
@@ -43,6 +43,7 @@ try:
                 - config_name: Environment-specific config name
                 - model_path: Path to pretrained weights
                 - xvla: Nested XVLA configuration dict
+            torch_dtype: Optional torch dtype for model weights (ignored, uses config dtype)
                 
         Returns:
             XVLAForRLActionPrediction instance with Florence2 backbone
@@ -55,8 +56,12 @@ try:
         if config_name is None:
             raise ValueError("config_name is required for XVLA model (e.g., 'xvla_libero')")
         
-        # Get environment-specific training config (for data transforms)
-        train_config = get_xvla_config(config_name, model_path=cfg.model_path)
+        # Get environment-specific training config (for data transforms) - optional for eval
+        try:
+            train_config = get_xvla_config(config_name, model_path=cfg.model_path)
+        except (ValueError, NotImplementedError):
+            # Config not registered or not implemented - skip for evaluation
+            train_config = None
         
         # Build Florence2 config from nested structure
         florence_config_dict = getattr(xvla_cfg, "florence_config", {

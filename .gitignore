@@ -19,3 +19,7 @@ outputs/*
 uv.lock
 rlinf/envs/maniskill/assets
 PKG-INFO
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+pixi.lock

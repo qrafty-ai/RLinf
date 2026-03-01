@@ -18,7 +18,7 @@ https://github.com/huggingface/lerobot
 """
 
 from dataclasses import dataclass, field
-from typing import Any, List
+from typing import Any, List, Optional
 
 
 @dataclass
@@ -112,6 +112,12 @@ class Florence2LanguageConfig:
     is_encoder_decoder: bool = True
     decoder_start_token_id: int = 2
     forced_eos_token_id: int = 2
+    
+    # Attention implementation: "eager", "sdpa", or "flash_attention_2"
+    _attn_implementation: str = "sdpa"
+    
+    # Attention implementation: "eager", "sdpa", or "flash_attention_2"
+    _attn_implementation: str = "sdpa"
 
 
 @dataclass
@@ -124,8 +130,8 @@ class Florence2Config:
     is_composition: bool = False
     
     # Sub-configs
-    vision_config: Florence2VisionConfig = None
-    text_config: Florence2LanguageConfig = None
+    vision_config: Optional[Florence2VisionConfig] = None
+    text_config: Optional[Florence2LanguageConfig] = None
     
     # Fusion and projection
     projection_dim: int = 1024
