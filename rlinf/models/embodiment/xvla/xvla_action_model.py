@@ -24,6 +24,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import BartTokenizerFast
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.xvla.configuration_xvla import XVLAConfig
@@ -114,20 +115,31 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         # 7. Apply freezing
         self._apply_freezing()
         
+        # 8. Initialize BART tokenizer for language instructions
+        self.tokenizer = BartTokenizerFast.from_pretrained(
+            config.tokenizer_name,
+            padding_side=config.tokenizer_padding_side,
+        )
+        self.tokenizer_max_length = config.tokenizer_max_length
+        
         self.logger.info(f"Initialized XVLA model with config: {config.config_name}")
         self.logger.info(f"  Florence2 projection dim: {projection_dim}")
         self.logger.info(f"  Policy head hidden size: {config.hidden_size}")
         self.logger.info(f"  Action dimension: {config.max_action_dim}")
         self.logger.info(f"  Proprio dimension: {proprio_dim}")
+        self.logger.info(f"  Domain ID: {config.domain_id}")
+        self.logger.info(f"  Tokenizer: {config.tokenizer_name} (max_length={config.tokenizer_max_length})")
     
     def _build_florence_config(self) -> Florence2Config:
         """Build Florence2Config from nested config dict."""
-        config_dict = dict(self.config.florence_config)
-        
-        # Ensure vision_config and text_config are properly nested
-        if "vision_config" in config_dict and isinstance(config_dict["vision_config"], dict):
-            pass  # Already nested
-        
+        from omegaconf import DictConfig, OmegaConf
+
+        florence_cfg = self.config.florence_config
+        if isinstance(florence_cfg, DictConfig):
+            config_dict = OmegaConf.to_container(florence_cfg, resolve=True)
+        else:
+            config_dict = dict(florence_cfg)
+
         return Florence2Config(**config_dict)
     
     def _remove_unused_decoder(self):
@@ -210,46 +222,38 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         Returns:
             Visual-language features [batch, seq_len, projection_dim]
         """
-        # Note: pixel_values should be [batch, num_images, C, H, W]
-        # The Florence2Model expects pixel_values with batch dimension matching input_ids
-        # Each image in the batch is processed separately by the vision encoder
-        batch_size = pixel_values.shape[0]
-        
-        # Forward through Florence2 model encoder only (skip decoder for XVLA)
-        # First get image embeddings from vision model
-        image_embeds = self.vlm.model.vision_model(pixel_values)
-        if self.vlm.model.vision_projection is not None:
-            image_embeds = self.vlm.model.vision_projection(image_embeds)
-        
-        # Expand to sequence length if needed (vision model returns [batch, dim])
-        if len(image_embeds.shape) == 2:
-            image_embeds = image_embeds.unsqueeze(1)  # [batch, 1, dim]
-        
-        # Get text embeddings
-        text_embeds = self.vlm.model.language_model.encoder.embed_tokens(input_ids) * \
-                      self.vlm.model.language_model.encoder.embed_scale
-        
-        # Concatenate image and text embeddings
-        combined_embeds = torch.cat([image_embeds, text_embeds], dim=1)  # [batch, 1+seq_len, dim]
-        
-        # Create attention mask for combined sequence
-        batch_size = pixel_values.shape[0]
-        image_attention_mask = torch.ones(
-            (batch_size, image_embeds.shape[1]), 
-            dtype=attention_mask.dtype, 
-            device=attention_mask.device
+        if not hasattr(self, "_debug_vlm_shapes_logged"):
+            self._debug_vlm_shapes_logged = True
+            self.logger.info(f"_get_vlm_features pixel_values shape: {tuple(pixel_values.shape)}")
+            self.logger.info(f"_get_vlm_features input_ids shape: {tuple(input_ids.shape)}")
+
+        # pixel_values shape: [batch, num_images, C, H, W]
+        # Florence2 custom implementation expects 4D image tensor, so we use
+        # the first view for now to keep compatibility and stability.
+        if pixel_values.dim() == 5:
+            pixel_values = pixel_values[:, 0]
+
+        # Encode image tokens with Florence2 custom image encoder
+        image_features = self.vlm._encode_image(pixel_values)
+
+        # Get text token embeddings
+        text_embeds = self.vlm.get_input_embeddings()(input_ids)
+
+        # Merge image and text tokens and attention masks
+        combined_embeds, combined_attention_mask = self.vlm._merge_input_ids_with_image_features(
+            image_features,
+            text_embeds,
         )
-        combined_attention_mask = torch.cat([image_attention_mask, attention_mask], dim=1)
-        
-        # Forward through encoder only
-        encoder_outputs = self.vlm.model.language_model.encoder(
+        if attention_mask is not None:
+            combined_attention_mask[:, image_features.shape[1] :] = attention_mask
+
+        # Run encoder-only path
+        encoder_outputs = self.vlm.language_model.model.encoder(
             inputs_embeds=combined_embeds,
             attention_mask=combined_attention_mask,
         )
-        
-        features = encoder_outputs.last_hidden_state
-        
-        return features
+
+        return encoder_outputs.last_hidden_state
     
     def forward(
         self,
@@ -423,11 +427,10 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         Returns:
             Dictionary with actions
         """
-        # Process observations
-        processed_obs = self.obs_processor(env_obs)
-        transformed_obs = self.input_transform(processed_obs)
+        # Process observations through input_transform (merged obs_processor + transform)
+        transformed_obs = self.input_transform(env_obs)
         
-        # Get VLM features
+        # Extract transformed inputs
         pixel_values = transformed_obs["pixel_values"]
         input_ids = transformed_obs["input_ids"]
         attention_mask = transformed_obs["attention_mask"]
@@ -544,19 +547,29 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         outputs = self.sft_forward(data)
         return outputs["loss"]
     
-    def obs_processor(self, env_obs: dict[str, Any]) -> dict[str, Any]:
-        """Process raw environment observations into model inputs.
+    def input_transform(
+        self,
+        env_obs: dict[str, Any],
+        transpose: bool = False
+    ) -> dict[str, Any]:
+        """Transform environment observations to model format.
+        
+        Combines obs_processor and input_transform into single method.
+        Handles conversion from environment-specific state formats to LeRobot format.
+        Currently supports:
+          - LIBERO: 8D [pos(3), axis_angle(3), gripper(2)] → 20D LeRobot format
+          - LeRobot: 20D [pos(3), rot6d(6), gripper(1), zeros(10)] (passthrough)
         
         Args:
-            env_obs: Raw observation containing:
-                - images: List of images or dict of cameras
-                - states: Robot state
-                - task_descriptions: Language instructions
-                
+            env_obs: Environment observation dictionary with images, states, task_descriptions
+            transpose: Whether to transpose dimensions (not used)
+            
         Returns:
-            Processed observation dictionary
+            Dictionary with pixel_values, input_ids, attention_mask, proprio, domain_id
         """
-        # Extract images
+        device = next(self.parameters()).device
+        
+        # === Step 1: Extract and process images ===
         if "images" in env_obs:
             images = env_obs["images"]
         elif "main_images" in env_obs:
@@ -571,58 +584,138 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         else:
             raise ValueError(f"No images found in observation. Keys: {list(env_obs.keys())}")
         
-        # Extract state
+        # Infer batch size from images
+        if isinstance(images[0], torch.Tensor):
+            batch_size = images[0].shape[0]
+        elif isinstance(images[0], np.ndarray):
+            batch_size = images[0].shape[0]
+        else:
+            batch_size = 1
+
+        if not hasattr(self, "_debug_input_transform_logged"):
+            self._debug_input_transform_logged = True
+            first_shape = tuple(images[0].shape) if hasattr(images[0], "shape") else type(images[0])
+            self.logger.info(f"input_transform first image shape: {first_shape}")
+        
+        # Stack images and normalize tensor layout to [batch, num_views, 3, H, W]
+        if isinstance(images[0], torch.Tensor):
+            pixel_values = torch.stack(images, dim=1)
+        else:
+            pixel_values = torch.from_numpy(np.stack(images, axis=0)).float()
+            pixel_values = pixel_values.unsqueeze(1)
+
+        # Handle channel-last inputs, e.g. [B, V, H, W, 3] -> [B, V, 3, H, W]
+        if pixel_values.dim() == 5 and pixel_values.shape[-1] == 3:
+            pixel_values = pixel_values.permute(0, 1, 4, 2, 3)
+
+        # Handle single-view channel-last [B, H, W, 3] -> [B, 1, 3, H, W]
+        if pixel_values.dim() == 4 and pixel_values.shape[-1] == 3:
+            pixel_values = pixel_values.permute(0, 3, 1, 2).unsqueeze(1)
+
+        # Resize to 224x224 if needed
+        if pixel_values.shape[-1] != 224:
+            pixel_values = F.interpolate(
+                pixel_values.flatten(0, 1),
+                size=(224, 224),
+                mode="bilinear",
+                align_corners=False,
+            ).unflatten(0, (batch_size, -1))
+
+        # Ensure image tensor is on the same device as model weights
+        pixel_values = pixel_values.to(device)
+        
+        # === Step 2: Extract and tokenize language ===
+        task_desc = env_obs.get("task_descriptions", env_obs.get("language_instruction", ""))
+        if isinstance(task_desc, str):
+            task_desc = [task_desc] * batch_size
+        
+        tokenized = self.tokenizer(
+            task_desc,
+            padding="max_length",
+            truncation=True,
+            max_length=self.tokenizer_max_length,
+            return_tensors="pt",
+        )
+        input_ids = tokenized.input_ids.to(device)
+        attention_mask = tokenized.attention_mask.to(device)
+        
+        # === Step 3: Extract and process proprioception ===
         state = env_obs.get("states", env_obs.get("agent_pos", None))
         
-        # Extract task description
-        task_desc = env_obs.get("task_descriptions", env_obs.get("language_instruction", ""))
+        if state is not None and self.proprio_dim > 0:
+            if isinstance(state, np.ndarray):
+                state = torch.from_numpy(state).float().to(device)
+            elif isinstance(state, torch.Tensor):
+                state = state.to(device)
+            
+            # Detect state format and convert if needed
+            state_dim = state.shape[-1]
+            
+            if state_dim == 8:
+                # LIBERO format: [pos(3), axis_angle(3), gripper(2)]
+                proprio = self._convert_libero_state_to_lerobot(state)
+            elif state_dim == 20:
+                # Already LeRobot format
+                proprio = state
+            else:
+                # Unknown format - pad as needed
+                self.logger.warning(f"Unknown state dimension {state_dim}, using as-is")
+                if state_dim < self.proprio_dim:
+                    padding = torch.zeros(batch_size, self.proprio_dim - state_dim, device=device)
+                    proprio = torch.cat([state, padding], dim=-1)
+                else:
+                    proprio = state[:, :self.proprio_dim]
+            
+            # Ensure correct shape
+            if proprio.dim() == 1:
+                proprio = proprio.unsqueeze(0)
+            if proprio.shape[-1] < self.proprio_dim:
+                padding = torch.zeros(batch_size, self.proprio_dim - proprio.shape[-1], device=device)
+                proprio = torch.cat([proprio, padding], dim=-1)
+        else:
+            proprio = None
+        
+        # === Step 4: Add domain ID ===
+        domain_id = torch.full((batch_size,), self.config.domain_id, dtype=torch.long, device=device)
         
         return {
-            "images": images,
-            "state": state,
-            "task_description": task_desc,
+            "pixel_values": pixel_values,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "proprio": proprio,
+            "domain_id": domain_id,
         }
     
-    def input_transform(
-        self,
-        inputs: dict[str, Any],
-        transpose: bool = False
-    ) -> dict[str, Any]:
-        """Transform inputs to model format.
+    def _convert_libero_state_to_lerobot(self, libero_state: torch.Tensor) -> torch.Tensor:
+        """Convert LIBERO 8D state to LeRobot 20D format.
         
-        This should integrate with the tokenizer/processor.
+        Args:
+            libero_state: [batch, 8] = [pos(3), axis_angle(3), gripper(2)]
+            
+        Returns:
+            lerobot_state: [batch, 20] = [pos(3), rot6d(6), gripper(1), zeros(10)]
         """
-        # TODO: Integrate with Florence2Processor for proper tokenization
-        # For now, return as-is with dummy values
-        device = next(self.parameters()).device
+        from rlinf.models.embodiment.xvla.rotation_utils import axis_angle_to_rotation_6d
         
-        # Infer batch size from state tensor
-        state = inputs.get("state")
-        if isinstance(state, torch.Tensor):
-            batch_size = state.shape[0]
-        elif isinstance(state, np.ndarray):
-            batch_size = state.shape[0]
-        else:
-            # Fallback: try to get batch size from images
-            images = inputs.get("images", [])
-            if images and len(images) > 0:
-                first_img = images[0]
-                if isinstance(first_img, torch.Tensor):
-                    batch_size = first_img.shape[0]
-                elif isinstance(first_img, np.ndarray):
-                    batch_size = first_img.shape[0]
-                else:
-                    batch_size = 1
-            else:
-                batch_size = 1
+        # Extract components
+        pos = libero_state[..., :3]  # [batch, 3]
+        axis_angle = libero_state[..., 3:6]  # [batch, 3]
+        gripper = libero_state[..., 6:8]  # [batch, 2]
         
-        # Create dummy tensors (should be replaced with actual processing)
-        return {
-            "pixel_values": torch.randn(batch_size, self.config.num_images_in_input, 3, 224, 224, device=device),
-            "input_ids": torch.zeros(batch_size, self.config.tokenizer_max_length, dtype=torch.long, device=device),
-            "attention_mask": torch.ones(batch_size, self.config.tokenizer_max_length, device=device),
-            "proprio": torch.zeros(batch_size, self.proprio_dim, device=device) if self.proprio_dim > 0 else None,
-        }
+        # Convert axis-angle to 6D rotation
+        rot6d = axis_angle_to_rotation_6d(axis_angle)  # [batch, 6]
+        
+        # Use first gripper finger (or mean)
+        gripper_1d = gripper[..., :1]  # [batch, 1]
+        
+        # Build 10D LeRobot state
+        state_10d = torch.cat([pos, rot6d, gripper_1d], dim=-1)  # [batch, 10]
+        
+        # Zero-pad to 20D
+        padding = torch.zeros(*state_10d.shape[:-1], 10, device=state_10d.device)
+        state_20d = torch.cat([state_10d, padding], dim=-1)  # [batch, 20]
+        
+        return state_20d
     
     def output_transform(self, outputs: dict[str, Any]) -> dict[str, Any]:
         """Transform model outputs to environment format."""

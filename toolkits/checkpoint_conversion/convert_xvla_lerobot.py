@@ -32,9 +32,10 @@ Usage:
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -71,6 +72,73 @@ def load_lerobot_weights(checkpoint_dir: Path) -> Dict[str, torch.Tensor]:
         )
 
 
+def _map_weight_name(old_name: str) -> Tuple[Optional[str], Optional[str]]:
+    """Map a LeRobot checkpoint key to RLinf XVLA key.
+
+    Returns:
+        (new_key, skip_reason)
+        - new_key is None when key should be skipped.
+        - skip_reason is set when key is skipped.
+    """
+    new_name = old_name
+
+    # Remove top-level "model." prefix
+    if new_name.startswith("model."):
+        new_name = new_name[6:]
+
+    # VLM keys are structurally aligned
+    if new_name.startswith("vlm."):
+        return new_name, None
+
+    # LeRobot transformer -> RLinf policy_head
+    if not new_name.startswith("transformer."):
+        return None, "unsupported_prefix"
+
+    key = new_name[len("transformer.") :]
+
+    # Direct module remaps
+    direct_map = {
+        "action_encoder.fc.weight": "policy_head.action_in_proj.weight",
+        "action_encoder.bias.weight": "policy_head.action_in_proj.bias",
+        "action_decoder.fc.weight": "policy_head.action_out_proj.weight",
+        "action_decoder.bias.weight": "policy_head.action_out_proj.bias",
+        "vlm_proj.weight": "policy_head.input_proj.weight",
+        "vlm_proj.bias": "policy_head.input_proj.bias",
+        "norm.weight": "policy_head.norm.weight",
+        "norm.bias": "policy_head.norm.bias",
+        "soft_prompt_hub.weight": "policy_head.soft_prompt_hub.soft_prompts",
+    }
+    if key in direct_map:
+        return direct_map[key], None
+
+    # No target module in current RLinf implementation
+    if key.startswith("aux_visual_proj."):
+        return None, "aux_visual_proj_unused"
+    if key == "pos_emb":
+        return None, "pos_emb_unused"
+
+    # Block-wise remap:
+    # blocks.i.attn.(qkv|proj).{weight,bias} -> policy_head.blocks.i.attn...
+    # blocks.i.norm1|norm2.{weight,bias}      -> policy_head.blocks.i.norm...
+    # blocks.i.mlp.fc1|fc2.{weight,bias}      -> policy_head.blocks.i.mlp.0|2...
+    m = re.match(r"^blocks\.(\d+)\.(.+)$", key)
+    if not m:
+        return None, "unrecognized_transformer_key"
+
+    block_idx = m.group(1)
+    tail = m.group(2)
+
+    if tail.startswith("attn.") or tail.startswith("norm1.") or tail.startswith("norm2."):
+        return f"policy_head.blocks.{block_idx}.{tail}", None
+
+    if tail.startswith("mlp.fc1."):
+        return f"policy_head.blocks.{block_idx}.mlp.0.{tail[len('mlp.fc1.'):]}", None
+    if tail.startswith("mlp.fc2."):
+        return f"policy_head.blocks.{block_idx}.mlp.2.{tail[len('mlp.fc2.'):]}", None
+
+    return None, "unrecognized_block_tail"
+
+
 def convert_weight_mapping(lerobot_weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     """Map LeRobot weight names to RLinf names.
     
@@ -85,41 +153,22 @@ def convert_weight_mapping(lerobot_weights: Dict[str, torch.Tensor]) -> Dict[str
     - vlm.* -> Florence2 (same)
     - policy_head.* -> All policy components
     """
-    rlinf_weights = {}
-    
+    rlinf_weights: Dict[str, torch.Tensor] = {}
+    skipped: Dict[str, int] = {}
+
     for old_name, tensor in lerobot_weights.items():
-        new_name = old_name
-        
-        # Rule 1: Remove 'model.' prefix
-        if new_name.startswith("model."):
-            new_name = new_name[6:]
-        
-        # Rule 2: VLM weights stay as-is (vlm.*)
-        if new_name.startswith("vlm."):
-            pass  # Keep as vlm.*
-        
-        # Rule 3: Map policy components to policy_head.*
-        elif new_name.startswith("transformer."):
-            new_name = "policy_head." + new_name
-        elif new_name.startswith("action_in_proj."):
-            new_name = "policy_head.action_in_proj." + new_name[15:]
-        elif new_name.startswith("action_out_proj."):
-            new_name = "policy_head.action_out_proj." + new_name[16:]
-        elif new_name.startswith("time_mlp_in."):
-            new_name = "policy_head.time_mlp_in." + new_name[12:]
-        elif new_name.startswith("time_mlp_out."):
-            new_name = "policy_head.time_mlp_out." + new_name[13:]
-        elif new_name.startswith("soft_prompt_hub."):
-            new_name = "policy_head.soft_prompt_hub." + new_name[16:]
-        elif new_name == "time_mlp_in" or new_name == "time_mlp_out":
-            # Handle case without trailing dot
-            if new_name == "time_mlp_in":
-                new_name = "policy_head.time_mlp_in"
-            else:
-                new_name = "policy_head.time_mlp_out"
-        
+        new_name, skip_reason = _map_weight_name(old_name)
+        if new_name is None:
+            reason = skip_reason or "unknown"
+            skipped[reason] = skipped.get(reason, 0) + 1
+            continue
         rlinf_weights[new_name] = tensor
-    
+
+    if skipped:
+        print("Skipped keys summary:")
+        for reason, count in sorted(skipped.items()):
+            print(f"  - {reason}: {count}")
+
     return rlinf_weights
 
 
@@ -128,48 +177,61 @@ def convert_config(lerobot_config: dict) -> dict:
     
     LeRobot config has nested structure that needs to be adapted.
     """
+    # Flatten nested policy config when loading from newer LeRobot checkpoints
+    if "policy" in lerobot_config and isinstance(lerobot_config["policy"], dict):
+        policy_cfg = lerobot_config["policy"]
+    else:
+        policy_cfg = lerobot_config
+
+    chunk_size = policy_cfg.get("chunk_size", 32)
+    max_action_dim = policy_cfg.get("max_action_dim", 20)
+
     # Extract relevant fields
     rlinf_config = {
         "model_type": "xvla",
-        "config_name": lerobot_config.get("config_name", "xvla_libero"),
-        "num_action_chunks": lerobot_config.get("chunk_size", 32),
-        "action_dim": 7,  # Default for LIBERO
+        "config_name": policy_cfg.get("config_name", "xvla_libero"),
+        "num_action_chunks": chunk_size,
+        "action_dim": max_action_dim,
         "precision": "bfloat16",
         "is_lora": False,
         "xvla": {
             # Florence2 config (pass through)
-            "florence_config": lerobot_config.get("florence_config", {}),
+            "florence_config": policy_cfg.get("florence_config", {}),
             
             # Tokenizer
-            "tokenizer_name": lerobot_config.get("tokenizer_name", "facebook/bart-large"),
-            "tokenizer_max_length": lerobot_config.get("tokenizer_max_length", 64),
+            "tokenizer_name": policy_cfg.get("tokenizer_name", "facebook/bart-base"),
+            "tokenizer_max_length": policy_cfg.get("tokenizer_max_length", 96),
+            "tokenizer_padding_side": policy_cfg.get("tokenizer_padding_side", "right"),
+            "domain_id": policy_cfg.get("domain_id", 3),
             
             # SoftPromptedTransformer
-            "hidden_size": lerobot_config.get("hidden_size", 1024),
-            "depth": lerobot_config.get("depth", 24),
-            "num_heads": lerobot_config.get("num_heads", 16),
-            "mlp_ratio": lerobot_config.get("mlp_ratio", 4.0),
-            "num_domains": lerobot_config.get("num_domains", 30),
-            "len_soft_prompts": lerobot_config.get("len_soft_prompts", 32),
-            "dim_time": lerobot_config.get("dim_time", 32),
-            "use_hetero_proj": lerobot_config.get("use_hetero_proj", False),
+            "hidden_size": policy_cfg.get("hidden_size", 1024),
+            "depth": policy_cfg.get("depth", 24),
+            "num_heads": policy_cfg.get("num_heads", 16),
+            "mlp_ratio": policy_cfg.get("mlp_ratio", 4.0),
+            "num_domains": policy_cfg.get("num_domains", 30),
+            "len_soft_prompts": policy_cfg.get("len_soft_prompts", 32),
+            "dim_time": policy_cfg.get("dim_time", 32),
+            "use_hetero_proj": policy_cfg.get("use_hetero_proj", False),
             
             # Flow-matching
             "noise_method": "flow_matching",
-            "num_steps": lerobot_config.get("num_denoising_steps", 10),
+            "num_steps": policy_cfg.get("num_denoising_steps", 10),
             "sigma_min": 0.001,
             "sigma_max": 1.0,
             "rho": 7.0,
             "time_schedule": "lognorm",
+            "chunk_size": chunk_size,
+            "n_action_steps": policy_cfg.get("n_action_steps", chunk_size),
             
             # Action space
-            "action_mode": lerobot_config.get("action_mode", "ee6d"),
-            "max_action_dim": lerobot_config.get("max_action_dim", 20),
+            "action_mode": policy_cfg.get("action_mode", "ee6d"),
+            "max_action_dim": max_action_dim,
             
             # Observation
-            "num_images_in_input": lerobot_config.get("num_images_in_input", 2),
-            "use_proprio": lerobot_config.get("use_proprio", True),
-            "max_state_dim": lerobot_config.get("max_state_dim", 32),
+            "num_images_in_input": policy_cfg.get("num_images_in_input", 2),
+            "use_proprio": policy_cfg.get("use_proprio", True),
+            "max_state_dim": policy_cfg.get("max_state_dim", 20),
             
             # Training
             "dtype": "bfloat16",
@@ -208,27 +270,11 @@ def verify_conversion(
     missing_keys = []
     
     for key in lerobot_weights.keys():
-        # Calculate expected RLinf key
-        new_key = key
-        if new_key.startswith("model."):
-            new_key = new_key[6:]
-        
-        if new_key.startswith("vlm."):
-            pass
-        elif new_key.startswith("transformer."):
-            new_key = "policy_head." + new_key
-        elif new_key.startswith("action_in_proj."):
-            new_key = "policy_head.action_in_proj." + new_key[15:]
-        elif new_key.startswith("action_out_proj."):
-            new_key = "policy_head.action_out_proj." + new_key[16:]
-        elif new_key.startswith("time_mlp_in."):
-            new_key = "policy_head.time_mlp_in." + new_key[12:]
-        elif new_key.startswith("time_mlp_out."):
-            new_key = "policy_head.time_mlp_out." + new_key[13:]
-        elif new_key.startswith("soft_prompt_hub."):
-            new_key = "policy_head.soft_prompt_hub." + new_key[16:]
-        
-        if new_key in rlinf_weights:
+        mapped_key, skip_reason = _map_weight_name(key)
+        if mapped_key is None:
+            continue
+
+        if mapped_key in rlinf_weights:
             converted_count += 1
         else:
             missing_keys.append(key)
@@ -244,12 +290,13 @@ def verify_conversion(
     
     # Check shapes match
     shape_mismatches = []
-    for old_key, new_key in zip(lerobot_weights.keys(), rlinf_weights.keys()):
-        if old_key in lerobot_weights and new_key in rlinf_weights:
-            old_shape = lerobot_weights[old_key].shape
-            new_shape = rlinf_weights[new_key].shape
-            if old_shape != new_shape:
-                shape_mismatches.append((old_key, old_shape, new_shape))
+    for old_key, old_tensor in lerobot_weights.items():
+        mapped_key, _ = _map_weight_name(old_key)
+        if mapped_key is None or mapped_key not in rlinf_weights:
+            continue
+        new_shape = rlinf_weights[mapped_key].shape
+        if old_tensor.shape != new_shape:
+            shape_mismatches.append((old_key, old_tensor.shape, new_shape))
     
     if shape_mismatches:
         print(f"\nShape mismatches: {len(shape_mismatches)}")

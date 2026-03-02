@@ -103,10 +103,17 @@ class XVLAConfig:
     })
     
     # Tokenizer configuration
-    tokenizer_name: str = "facebook/bart-large"
-    tokenizer_max_length: int = 64
+    tokenizer_name: str = "facebook/bart-base"
+    tokenizer_max_length: int = 96  # Match LeRobot
     tokenizer_padding_side: str = "right"
     pad_language_to: str = "max_length"
+    
+    # =========================================================================
+    # Domain Configuration (for domain-adaptation)
+    # =========================================================================
+    # Domain IDs: Bridge=0, LIBERO=3, ManiSkill=4, etc.
+    domain_id: int = 3  # Default to LIBERO
+    use_domain_adaptation: bool = True
     
     # =========================================================================
     # SoftPromptedTransformer Policy Head

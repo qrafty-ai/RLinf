@@ -17,137 +17,182 @@ Adapted from LeRobot's XVLA implementation:
 https://github.com/huggingface/lerobot
 """
 
-from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
+from transformers import PretrainedConfig
 
-@dataclass
-class Florence2VisionConfig:
+
+class Florence2VisionConfig(PretrainedConfig):
     """Configuration for Florence2 vision encoder (DaViT architecture).
     
     DaViT: Dual Attention Vision Transformer with hierarchical feature extraction.
     """
-    model_type: str = "davit"
+    model_type = "davit"
     
-    # Dropout and regularization
-    drop_path_rate: float = 0.1
-    
-    # Patch embedding parameters (hierarchical stages)
-    patch_size: List[int] = field(default_factory=lambda: [7, 3, 3, 3])
-    patch_stride: List[int] = field(default_factory=lambda: [4, 2, 2, 2])
-    patch_padding: List[int] = field(default_factory=lambda: [3, 1, 1, 1])
-    patch_prenorm: List[bool] = field(default_factory=lambda: [False, True, True, True])
-    
-    # Architecture dimensions
-    dim_embed: List[int] = field(default_factory=lambda: [256, 512, 1024, 2048])
-    num_heads: List[int] = field(default_factory=lambda: [8, 16, 32, 64])
-    num_groups: List[int] = field(default_factory=lambda: [8, 16, 32, 64])
-    depths: List[int] = field(default_factory=lambda: [1, 1, 9, 1])
-    window_size: int = 12
-    projection_dim: int = 1024
-    
-    # Temporal and positional embeddings
-    visual_temporal_embedding: dict = field(default_factory=lambda: {
-        "type": "COSINE",
-        "max_temporal_embeddings": 100,
-    })
-    image_pos_embed: dict = field(default_factory=lambda: {
-        "type": "learned_abs_2d",
-        "max_pos_embeddings": 1000,
-    })
-    
-    # Feature extraction
-    image_feature_source: List[str] = field(default_factory=lambda: [
-        "spatial_avg_pool", "temporal_avg_pool"
-    ])
-    
-    # Gradient checkpointing
-    enable_checkpoint: bool = False
+    def __init__(
+        self,
+        drop_path_rate: float = 0.1,
+        patch_size: List[int] = None,
+        patch_stride: List[int] = None,
+        patch_padding: List[int] = None,
+        patch_prenorm: List[bool] = None,
+        dim_embed: List[int] = None,
+        num_heads: List[int] = None,
+        num_groups: List[int] = None,
+        depths: List[int] = None,
+        window_size: int = 12,
+        projection_dim: int = 1024,
+        visual_temporal_embedding: dict = None,
+        image_pos_embed: dict = None,
+        image_feature_source: List[str] = None,
+        enable_checkpoint: bool = False,
+        **kwargs: Any,
+    ):
+        self.drop_path_rate = drop_path_rate
+        self.patch_size = patch_size if patch_size is not None else [7, 3, 3, 3]
+        self.patch_stride = patch_stride if patch_stride is not None else [4, 2, 2, 2]
+        self.patch_padding = patch_padding if patch_padding is not None else [3, 1, 1, 1]
+        self.patch_prenorm = patch_prenorm if patch_prenorm is not None else [False, True, True, True]
+        self.dim_embed = dim_embed if dim_embed is not None else [256, 512, 1024, 2048]
+        self.num_heads = num_heads if num_heads is not None else [8, 16, 32, 64]
+        self.num_groups = num_groups if num_groups is not None else [8, 16, 32, 64]
+        self.depths = depths if depths is not None else [1, 1, 9, 1]
+        self.window_size = window_size
+        self.projection_dim = projection_dim
+        
+        self.visual_temporal_embedding = visual_temporal_embedding if visual_temporal_embedding is not None else {
+            "type": "COSINE",
+            "max_temporal_embeddings": 100,
+        }
+        self.image_pos_embed = image_pos_embed if image_pos_embed is not None else {
+            "type": "learned_abs_2d",
+            "max_pos_embeddings": 1000,
+        }
+        
+        self.image_feature_source = image_feature_source if image_feature_source is not None else [
+            "spatial_avg_pool", "temporal_avg_pool"
+        ]
+        self.enable_checkpoint = enable_checkpoint
+        
+        super().__init__(**kwargs)
 
 
-@dataclass
-class Florence2LanguageConfig:
+class Florence2LanguageConfig(PretrainedConfig):
     """Configuration for Florence2 language model (BART architecture).
     
     BART: Bidirectional and Auto-Regressive Transformers.
     """
-    model_type: str = "florence2_language"
+    model_type = "florence2_language"
     
-    # Vocabulary and embeddings
-    vocab_size: int = 51289
-    d_model: int = 1024
-    max_position_embeddings: int = 1024
-    scale_embedding: bool = False
-    
-    # Encoder
-    encoder_layers: int = 12
-    encoder_ffn_dim: int = 4096
-    encoder_attention_heads: int = 16
-    encoder_layerdrop: float = 0.0
-    
-    # Decoder (not used in XVLA, kept for completeness)
-    decoder_layers: int = 12
-    decoder_ffn_dim: int = 4096
-    decoder_attention_heads: int = 16
-    decoder_layerdrop: float = 0.0
-    
-    # Regularization
-    dropout: float = 0.1
-    attention_dropout: float = 0.0
-    activation_dropout: float = 0.0
-    classifier_dropout: float = 0.0
-    
-    # Activation and initialization
-    activation_function: str = "gelu"
-    init_std: float = 0.02
-    
-    # Other
-    use_cache: bool = True
-    num_labels: int = 3
-    
-    # Special tokens
-    pad_token_id: int = 1
-    bos_token_id: int = 0
-    eos_token_id: int = 2
-    is_encoder_decoder: bool = True
-    decoder_start_token_id: int = 2
-    forced_eos_token_id: int = 2
-    
-    # Attention implementation: "eager", "sdpa", or "flash_attention_2"
-    _attn_implementation: str = "sdpa"
-    
-    # Attention implementation: "eager", "sdpa", or "flash_attention_2"
-    _attn_implementation: str = "sdpa"
+    def __init__(
+        self,
+        vocab_size: int = 51289,
+        d_model: int = 1024,
+        max_position_embeddings: int = 1024,
+        scale_embedding: bool = False,
+        encoder_layers: int = 12,
+        encoder_ffn_dim: int = 4096,
+        encoder_attention_heads: int = 16,
+        encoder_layerdrop: float = 0.0,
+        decoder_layers: int = 12,
+        decoder_ffn_dim: int = 4096,
+        decoder_attention_heads: int = 16,
+        decoder_layerdrop: float = 0.0,
+        dropout: float = 0.1,
+        attention_dropout: float = 0.0,
+        activation_dropout: float = 0.0,
+        classifier_dropout: float = 0.0,
+        activation_function: str = "gelu",
+        init_std: float = 0.02,
+        use_cache: bool = True,
+        num_labels: int = 3,
+        pad_token_id: int = 1,
+        bos_token_id: int = 0,
+        eos_token_id: int = 2,
+        is_encoder_decoder: bool = True,
+        decoder_start_token_id: int = 2,
+        forced_eos_token_id: int = 2,
+        _attn_implementation: str = "sdpa",
+        **kwargs: Any,
+    ):
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.max_position_embeddings = max_position_embeddings
+        self.scale_embedding = scale_embedding
+        
+        self.encoder_layers = encoder_layers
+        self.encoder_ffn_dim = encoder_ffn_dim
+        self.encoder_attention_heads = encoder_attention_heads
+        self.encoder_layerdrop = encoder_layerdrop
+        
+        self.decoder_layers = decoder_layers
+        self.decoder_ffn_dim = decoder_ffn_dim
+        self.decoder_attention_heads = decoder_attention_heads
+        self.decoder_layerdrop = decoder_layerdrop
+        
+        self.dropout = dropout
+        self.attention_dropout = attention_dropout
+        self.activation_dropout = activation_dropout
+        self.classifier_dropout = classifier_dropout
+        
+        self.activation_function = activation_function
+        self.init_std = init_std
+        
+        self.use_cache = use_cache
+        self.num_labels = num_labels
+        
+        self.pad_token_id = pad_token_id
+        self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
+        self.is_encoder_decoder = is_encoder_decoder
+        self.decoder_start_token_id = decoder_start_token_id
+        self.forced_eos_token_id = forced_eos_token_id
+        
+        self._attn_implementation = _attn_implementation
+        
+        super().__init__(
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            is_encoder_decoder=is_encoder_decoder,
+            decoder_start_token_id=decoder_start_token_id,
+            **kwargs,
+        )
 
 
-@dataclass
-class Florence2Config:
+class Florence2Config(PretrainedConfig):
     """Configuration for Florence2 multimodal model.
     
     Combines DaViT vision encoder with BART language model for multimodal understanding.
     """
-    model_type: str = "florence2"
-    is_composition: bool = False
+    model_type = "florence2"
+    is_composition = True
     
-    # Sub-configs
-    vision_config: Optional[Florence2VisionConfig] = None
-    text_config: Optional[Florence2LanguageConfig] = None
-    
-    # Fusion and projection
-    projection_dim: int = 1024
-    
-    # Loss
-    ignore_index: int = -100
-    vocab_size: int = 51289
-    
-    def __post_init__(self):
-        """Initialize nested configs if provided as dicts."""
-        if isinstance(self.vision_config, dict):
-            self.vision_config = Florence2VisionConfig(**self.vision_config)
-        elif self.vision_config is None:
+    def __init__(
+        self,
+        vision_config: Optional[Florence2VisionConfig] = None,
+        text_config: Optional[Florence2LanguageConfig] = None,
+        projection_dim: int = 1024,
+        ignore_index: int = -100,
+        vocab_size: int = 51289,
+        **kwargs: Any,
+    ):
+        super().__init__(**kwargs)
+        
+        if vision_config is None:
             self.vision_config = Florence2VisionConfig()
-            
-        if isinstance(self.text_config, dict):
-            self.text_config = Florence2LanguageConfig(**self.text_config)
-        elif self.text_config is None:
+        elif isinstance(vision_config, dict):
+            self.vision_config = Florence2VisionConfig(**vision_config)
+        else:
+            self.vision_config = vision_config
+        
+        if text_config is None:
             self.text_config = Florence2LanguageConfig()
+        elif isinstance(text_config, dict):
+            self.text_config = Florence2LanguageConfig(**text_config)
+        else:
+            self.text_config = text_config
+        
+        self.projection_dim = projection_dim
+        self.ignore_index = ignore_index
+        self.vocab_size = vocab_size
