@@ -1,46 +1,206 @@
-# Copyright 2025 The RLinf Authors.
+# ------------------------------------------------------------------------------
+# Copyright 2025 2toINF (https://github.com/2toINF)
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     https://www.apache.org/licenses/LICENSE-2.0
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# ------------------------------------------------------------------------------
 
-"""SoftPromptedTransformer policy head for XVLA.
-
-Implements the policy transformer with domain-specific soft prompts
-for multi-domain action generation.
-"""
+from __future__ import annotations
 
 import math
-from typing import Optional
+from collections.abc import Iterable
+from functools import partial
+from typing import Final
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as functional
+
+# ------------------------------- Small utils ----------------------------------
+
+
+def _to_2tuple(x) -> tuple:
+    """Minimal replacement for timm.layers.to_2tuple."""
+    if isinstance(x, Iterable) and not isinstance(x, (str, bytes)):
+        t = tuple(x)
+        return (t[0], t[1]) if len(t) >= 2 else (t[0], t[0])
+    return (x, x)
+
+
+def _has_sdp_attention() -> bool:
+    """Check if we can use PyTorch fused scaled_dot_product_attention."""
+    return hasattr(functional, "scaled_dot_product_attention")
+
+
+# ---------------------------------- MLP --------------------------------------
+
+
+class Mlp(nn.Module):
+    """
+    MLP used in ViT-style blocks.
+
+    Supports Linear or 1x1 Conv 'linear_layer' for token/channel mixing.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden_features: int | None = None,
+        out_features: int | None = None,
+        norm_layer: type[nn.Module] | None = None,
+        bias: bool | tuple[bool, bool] = True,
+        drop: float | tuple[float, float] = 0.0,
+        use_conv: bool = False,
+    ) -> None:
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        bias = _to_2tuple(bias)
+        drop_probs = _to_2tuple(drop)
+        linear_layer = partial(nn.Conv2d, kernel_size=1) if use_conv else nn.Linear
+
+        self.fc1 = linear_layer(in_features, hidden_features, bias=bias[0])
+        self.act = nn.GELU(approximate="tanh")
+        self.drop1 = nn.Dropout(drop_probs[0])
+        self.norm = norm_layer(hidden_features) if norm_layer is not None else nn.Identity()
+        self.fc2 = linear_layer(hidden_features, out_features, bias=bias[1])
+        self.drop2 = nn.Dropout(drop_probs[1])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Expect [B, T, C] for Linear variant; caller is responsible for shapes.
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop1(x)
+        x = self.norm(x)
+        x = self.fc2(x)
+        x = self.drop2(x)
+        return x
+
+
+# -------------------------------- Attention ----------------------------------
+
+
+class Attention(nn.Module):
+    """
+    Multi-Head Self-Attention with optional fused SDPA fallback.
+
+    If PyTorch provides `scaled_dot_product_attention`, it will be used
+    (usually faster and more stable); otherwise we use a manual implementation.
+    """
+
+    fused_attn: Final[bool]
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        qkv_bias: bool = False,
+        qk_norm: bool = False,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+        norm_layer: type[nn.Module] = nn.LayerNorm,
+    ) -> None:
+        super().__init__()
+        assert dim % num_heads == 0, "dim should be divisible by num_heads"
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim**-0.5
+        self.fused_attn = _has_sdp_attention()
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        x : Tensor, shape [batch_size, seq_len, channels]
+            Input sequence.
+
+        Returns
+        -------
+        Tensor, shape [batch_size, seq_len, channels]
+            Output sequence after MHSA + projection.
+        """
+        batch_size, seq_len, channels = x.shape
+        qkv = (
+            self.qkv(x)
+            .reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
+            .permute(2, 0, 3, 1, 4)  # 3 x [batch_size, num_heads, seq_len, head_dim]
+        )
+        q, k, v = qkv.unbind(0)  # each: [batch_size, num_heads, seq_len, head_dim]
+        q, k = self.q_norm(q), self.k_norm(k)
+
+        if self.fused_attn:
+            x = functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=self.attn_drop.p if self.training else 0.0,
+            )  # [batch_size, num_heads, seq_len, head_dim]
+        else:
+            q = q * self.scale
+            attn = q @ k.transpose(-2, -1)  # [batch_size, num_heads, seq_len, seq_len]
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x = attn @ v  # [batch_size, num_heads, seq_len, head_dim]
+
+        x = x.transpose(1, 2).reshape(batch_size, seq_len, channels)  # [batch_size, seq_len, channels]
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+# ------------------------------- Utilities -----------------------------------
+
+
+def basic_init(module: nn.Module) -> None:
+    """
+    Apply a basic initialization scheme to Linear layers.
+
+    - Weight: Xavier uniform initialization.
+    - Bias: Set to zero.
+    """
+    if isinstance(module, nn.Linear):
+        nn.init.xavier_uniform_(module.weight)
+        if module.bias is not None:
+            nn.init.constant_(module.bias, 0.0)
+
 
 def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 100) -> torch.Tensor:
-    """Create sinusoidal timestep embeddings.
+    """
+    Create sinusoidal timestep embeddings.
 
-    Args:
-        t: Timesteps [batch]
-        dim: Output embedding dimension
-        max_period: Controls minimum frequency
+    Parameters
+    ----------
+    t : torch.Tensor
+        Shape [B]. Each element is a timestep index, may be fractional.
+    dim : int
+        Dimensionality of the output embedding.
+    max_period : int, default=100
+        Controls the minimum frequency of the sinusoids.
 
-    Returns:
-        Embeddings [batch, dim]
+    Returns
+    -------
+    torch.Tensor
+        Shape [B, dim]. Sinusoidal embeddings.
     """
     half = dim // 2
     freqs = torch.exp(
-        -math.log(max_period)
-        * torch.arange(start=0, end=half, dtype=t.dtype, device=t.device)
-        / half
+        -math.log(max_period) * torch.arange(start=0, end=half, dtype=t.dtype, device=t.device) / half
     )
     args = t[:, None] * freqs[None]
     embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
@@ -49,292 +209,121 @@ def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 100) -> torc
     return embedding
 
 
+# ------------------------------- Core Layers ----------------------------------
+
+
 class DomainAwareLinear(nn.Module):
-    """Per-domain linear projection.
-    
-    Stores separate weights for each domain, enabling domain-specific
-    transformations. Used for action encoder/decoder in LeRobot XVLA.
-    
-    Weight shape: [num_domains, input_size * output_size] (flattened per-domain weights)
-    Bias shape: [num_domains, output_size]
     """
-    
-    def __init__(
-        self,
-        input_size: int,
-        output_size: int,
-        num_domains: int = 30,
-    ):
-        """Initialize domain-aware linear.
-        
-        Args:
-            input_size: Input feature dimension
-            output_size: Output feature dimension
-            num_domains: Number of domains
-        """
+    Linear layer with domain-conditioned parameters (per-sample).
+
+    Each domain has its own weight and bias vectors, stored in embeddings.
+    """
+
+    def __init__(self, input_size: int, output_size: int, num_domains: int = 20) -> None:
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
-        self.num_domains = num_domains
-        
-        # Per-domain weights stored as flattened [num_domains, input_size * output_size]
-        # This matches LeRobot checkpoint format
-        self.fc = nn.Embedding(num_domains, input_size * output_size)
+        self.fc = nn.Embedding(num_domains, output_size * input_size)
         self.bias = nn.Embedding(num_domains, output_size)
-        
-        # Initialize
         nn.init.xavier_uniform_(self.fc.weight)
         nn.init.zeros_(self.bias.weight)
-    
-    def forward(self, x: torch.Tensor, domain_id: torch.Tensor) -> torch.Tensor:
-        """Forward pass with domain-specific weights.
-        
-        Args:
-            x: Input tensor [batch, ..., input_size]
-            domain_id: Domain indices [batch]
-            
-        Returns:
-            Output tensor [batch, ..., output_size]
+
+    def forward(self, x: torch.Tensor, domain_id: torch.LongTensor) -> torch.Tensor:
         """
-        # Handle sequence input
+        Parameters
+        ----------
+        x : Tensor
+            [B, I] or [B, T, I]
+        domain_id : LongTensor
+            [B], domain indices.
+
+        Returns
+        -------
+        Tensor
+            [batch_size, output_size] or [batch_size, seq_len, output_size]
+        """
+        batch_size = domain_id.shape[0]
         squeeze_seq = False
         if x.dim() == 2:
-            x = x.unsqueeze(1)  # [batch, 1, input_size]
+            x = x.unsqueeze(1)
             squeeze_seq = True
-        
-        batch_size, seq_len, _ = x.shape
-        
-        # Get per-domain weights and biases
         weight = self.fc(domain_id).view(batch_size, self.input_size, self.output_size)
         bias = self.bias(domain_id).view(batch_size, self.output_size)
-        
-        # Apply linear transformation with domain-specific weights
-        # x: [batch, seq, input_size], weight: [batch, input_size, output_size]
-        y = torch.matmul(x, weight) + bias.unsqueeze(1)  # [batch, seq, output_size]
-        
+        y = torch.matmul(x, weight) + bias.view(batch_size, 1, self.output_size)
         if squeeze_seq:
             y = y.squeeze(1)
-        
         return y
 
 
-class SoftPromptHub(nn.Module):
-    """Domain-specific soft prompt embeddings.
-    
-    Maintains learnable soft prompts for multiple domains to enable
-    multi-domain training with domain-specific conditioning.
-    """
-    
-    def __init__(
-        self,
-        num_domains: int,
-        len_soft_prompts: int,
-        dim: int,
-    ):
-        """Initialize soft prompt hub.
-        
-        Args:
-            num_domains: Number of different domains
-            len_soft_prompts: Length of soft prompt sequence
-            dim: Embedding dimension
-        """
-        super().__init__()
-        self.num_domains = num_domains
-        self.len_soft_prompts = len_soft_prompts
-        self.dim = dim
-        
-        # Learnable soft prompts [num_domains, len_soft_prompts, dim]
-        self.soft_prompts = nn.Parameter(
-            torch.randn(num_domains, len_soft_prompts, dim) * 0.02
-        )
-    
-    def forward(self, domain_ids: Optional[torch.Tensor] = None, batch_size: int = 1) -> torch.Tensor:
-        """Get soft prompts for given domains.
-        
-        Args:
-            domain_ids: Domain indices [batch_size] or None for domain 0
-            batch_size: Batch size when domain_ids is None (default: 1)
-            
-        Returns:
-            Soft prompts [batch_size, len_soft_prompts, dim]
-        """
-        if domain_ids is None:
-            # Default to domain 0 for all batch items
-            domain_ids = torch.zeros(batch_size, dtype=torch.long, device=self.soft_prompts.device)
-        else:
-            batch_size = domain_ids.shape[0]
-        
-        # Index soft prompts
-        prompts = self.soft_prompts[domain_ids]  # [batch, len_soft_prompts, dim]
-        return prompts
-
-
-class MultiHeadAttention(nn.Module):
-    """Multi-head attention with optional soft prompt conditioning."""
-    
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        dropout: float = 0.0,
-    ):
-        """Initialize attention.
-        
-        Args:
-            dim: Model dimension
-            num_heads: Number of attention heads
-            dropout: Dropout rate
-        """
-        super().__init__()
-        assert dim % num_heads == 0
-        
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        
-        self.qkv = nn.Linear(dim, 3 * dim, bias=True)
-        self.proj = nn.Linear(dim, dim)
-        self.dropout = nn.Dropout(dropout)
-    
-    def forward(
-        self,
-        x: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Forward pass.
-        
-        Args:
-            x: Input [batch, seq_len, dim]
-            mask: Attention mask [batch, seq_len, seq_len]
-            
-        Returns:
-            Output [batch, seq_len, dim]
-        """
-        batch_size, seq_len, dim = x.shape
-        
-        # QKV projection
-        qkv = self.qkv(x).reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, batch, heads, seq, head_dim]
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        
-        # Attention
-        attn = (q @ k.transpose(-2, -1)) * self.scale  # [batch, heads, seq, seq]
-        
-        if mask is not None:
-            attn = attn.masked_fill(mask == 0, float('-inf'))
-        
-        attn = F.softmax(attn, dim=-1)
-        attn = self.dropout(attn)
-        
-        # Combine heads
-        out = (attn @ v).transpose(1, 2).reshape(batch_size, seq_len, dim)
-        out = self.proj(out)
-        out = self.dropout(out)
-        
-        return out
-
-
 class TransformerBlock(nn.Module):
-    """Transformer block with pre-norm."""
-    
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        mlp_ratio: float = 4.0,
-        dropout: float = 0.0,
-    ):
-        """Initialize block.
-        
-        Args:
-            dim: Model dimension
-            num_heads: Number of attention heads
-            mlp_ratio: MLP hidden dim ratio
-            dropout: Dropout rate
-        """
+    """
+    Standard Transformer block (pre-LN): LN → MHSA → residual, LN → MLP → residual.
+    """
+
+    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float = 4.0) -> None:
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = MultiHeadAttention(dim, num_heads, dropout)
-        self.norm2 = nn.LayerNorm(dim)
-        
-        mlp_dim = int(dim * mlp_ratio)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, mlp_dim),
-            nn.GELU(),
-            nn.Linear(mlp_dim, dim),
+        self.norm1 = nn.LayerNorm(hidden_size)
+        self.norm2 = nn.LayerNorm(hidden_size)
+        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, attn_drop=0.1)
+        self.mlp = Mlp(
+            in_features=hidden_size,
+            hidden_features=int(hidden_size * mlp_ratio),
+            drop=0.1,
         )
-    
-    def forward(
-        self,
-        x: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Forward with residual connections."""
-        x = x + self.attn(self.norm1(x), mask)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        x : Tensor, [B, T, H]
+
+        Returns
+        -------
+        Tensor, [B, T, H]
+        """
+        x = x + self.attn(self.norm1(x))
         x = x + self.mlp(self.norm2(x))
         return x
 
 
+# --------------------------- Main Model ---------------------------------------
+
+
 class SoftPromptedTransformer(nn.Module):
-    """Transformer policy head with soft prompts for multi-domain action generation.
-    
-    This is the core policy network that predicts flow-matching vector fields
-    for action generation, conditioned on visual-language features and domain.
-    
-    Supports LeRobot-compatible architecture:
-    - Action encoder/decoder are always domain-aware
-    - VLM/aux projections are optionally domain-aware (use_hetero_proj)
     """
-    
+    Multi-modal, domain-aware Transformer with optional soft prompts.
+
+    See parameter and forward I/O descriptions inside the docstrings.
+    """
+
     def __init__(
         self,
-        hidden_size: int,
-        multi_modal_input_size: int,
-        depth: int,
-        num_heads: int,
+        hidden_size: int = 768,
+        multi_modal_input_size: int = 768,
+        depth: int = 24,
+        num_heads: int = 16,
         mlp_ratio: float = 4.0,
-        num_domains: int = 30,
+        num_domains: int = 20,
         dim_action: int = 20,
-        dim_proprio: int = 0,
-        len_soft_prompts: int = 32,
+        dim_propio: int = 20,
         dim_time: int = 32,
+        len_soft_prompts: int = 32,
         max_len_seq: int = 512,
-        dropout: float = 0.1,
         use_hetero_proj: bool = False,
-    ):
-        """Initialize transformer.
-        
-        Args:
-            hidden_size: Hidden dimension
-            multi_modal_input_size: Size of visual-language features from Florence2
-            depth: Number of transformer layers
-            num_heads: Number of attention heads
-            mlp_ratio: MLP hidden dim ratio
-            num_domains: Number of domains for soft prompts
-            dim_action: Action dimension
-            dim_proprio: Proprioception dimension (0 if not used)
-            len_soft_prompts: Length of soft prompt sequence
-            dim_time: Time embedding dimension
-            dropout: Dropout rate
-            max_len_seq: Maximum sequence length for positional embeddings
-            use_hetero_proj: Use per-domain visual projections
-        """
+    ) -> None:
         super().__init__()
-        
         self.hidden_size = hidden_size
         self.dim_action = dim_action
-        self.dim_proprio = dim_proprio
         self.dim_time = dim_time
         self.len_soft_prompts = len_soft_prompts
         self.use_hetero_proj = use_hetero_proj
-        self.max_len_seq = max_len_seq
 
-        # Visual projections (LeRobot naming)
+        self.blocks = nn.ModuleList(
+            [TransformerBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)]
+        )
+
         if use_hetero_proj:
-            self.vlm_proj = DomainAwareLinear(
-                multi_modal_input_size, hidden_size, num_domains=num_domains
-            )
+            self.vlm_proj = DomainAwareLinear(multi_modal_input_size, hidden_size, num_domains=num_domains)
             self.aux_visual_proj = DomainAwareLinear(
                 multi_modal_input_size, hidden_size, num_domains=num_domains
             )
@@ -342,165 +331,85 @@ class SoftPromptedTransformer(nn.Module):
             self.vlm_proj = nn.Linear(multi_modal_input_size, hidden_size)
             self.aux_visual_proj = nn.Linear(multi_modal_input_size, hidden_size)
 
-        # Learned positional embeddings (LeRobot)
         self.pos_emb = nn.Parameter(torch.zeros(1, max_len_seq, hidden_size), requires_grad=True)
         nn.init.normal_(self.pos_emb, std=0.02)
 
-        # Action encoder/decoder are domain-aware in LeRobot
-        total_action_dim = dim_action + dim_proprio + dim_time
+        self.norm = nn.LayerNorm(hidden_size)
         self.action_encoder = DomainAwareLinear(
-            total_action_dim, hidden_size, num_domains=num_domains
+            dim_action + dim_time + dim_propio, hidden_size, num_domains=num_domains
         )
-        self.action_decoder = DomainAwareLinear(
-            hidden_size, dim_action, num_domains=num_domains
-        )
+        self.action_decoder = DomainAwareLinear(hidden_size, dim_action, num_domains=num_domains)
 
-        # Domain soft prompts
         if len_soft_prompts > 0:
             self.soft_prompt_hub = nn.Embedding(num_domains, len_soft_prompts * hidden_size)
             nn.init.normal_(self.soft_prompt_hub.weight, std=0.02)
-        else:
-            self.soft_prompt_hub = None
 
-        # Transformer blocks
-        self.blocks = nn.ModuleList([
-            TransformerBlock(hidden_size, num_heads, mlp_ratio, dropout)
-            for _ in range(depth)
-        ])
+        self.apply(basic_init)
 
-        self.norm = nn.LayerNorm(hidden_size)
-
-        self._init_weights()
-    
-    def _init_weights(self):
-        """Initialize weights."""
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-    
     def forward(
         self,
-        z_t: torch.Tensor,
+        domain_id: torch.LongTensor,
+        vlm_features: torch.Tensor,
+        aux_visual_inputs: torch.Tensor,
+        action_with_noise: torch.Tensor,
+        proprio: torch.Tensor,
         t: torch.Tensor,
-        multi_modal_features: torch.Tensor,
-        aux_visual_inputs: Optional[torch.Tensor] = None,
-        proprio: Optional[torch.Tensor] = None,
-        domain_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Predict vector field for flow-matching.
-        
-        Args:
-            z_t: Current noisy action [batch, action_dim] or [batch, chunk, action_dim]
-            t: Time [batch]
-            multi_modal_features: Visual-language features [batch, seq, dim]
-            aux_visual_inputs: Additional visual tokens [batch, seq_aux, dim] or None
-            proprio: Proprioception [batch, dim_proprio] or None
-            domain_ids: Domain indices [batch] or None
-            
-        Returns:
-            Predicted vector field [batch, action_dim] or [batch, chunk, action_dim]
         """
-        batch_size = z_t.shape[0]
+        Forward pass.
 
-        squeeze_actions = False
-        if z_t.dim() == 2:
-            z_t = z_t.unsqueeze(1)
-            squeeze_actions = True
+        Inputs
+        ------
+        domain_id : [B]
+        vlm_features : [B, T_vlm, D]
+        aux_visual_inputs : [B, T_aux, D]
+        action_with_noise : [B, T_action, dim_action]
+        proprio : [B, dim_propio]
+        t : [B]
 
-        _, num_actions, _ = z_t.shape
-        
-        # Default domain_ids to 0 if not provided
-        if domain_ids is None:
-            domain_ids = torch.zeros(batch_size, dtype=torch.long, device=z_t.device)
-        
-        # 1. Prepare visual features
-        if aux_visual_inputs is None:
-            aux_visual_inputs = multi_modal_features.new_zeros(
-                batch_size, 0, multi_modal_features.shape[-1]
-            )
+        Returns
+        -------
+        Tensor
+            Predicted actions, [batch_size, num_actions, dim_action]
+        """
+        batch_size, num_actions = action_with_noise.shape[:2]
 
+        # Encode (action + proprio + time) → tokens
+        time_emb = timestep_embedding(t, self.dim_time)  # [batch_size, dim_time]
+        time_tokens = time_emb.unsqueeze(1).expand(batch_size, num_actions, self.dim_time)
+        proprio_tokens = proprio.unsqueeze(1).expand(batch_size, num_actions, proprio.shape[-1])
+        action_tokens = torch.cat([action_with_noise, proprio_tokens, time_tokens], dim=-1)
+        x = self.action_encoder(action_tokens, domain_id)  # [batch_size, num_actions, hidden_size]
+
+        # Project visual streams and concatenate
         if self.use_hetero_proj:
-            mm_features = self.vlm_proj(multi_modal_features, domain_ids)
-            aux_features = self.aux_visual_proj(aux_visual_inputs, domain_ids)
-        else:
-            mm_features = self.vlm_proj(multi_modal_features)
-            aux_features = self.aux_visual_proj(aux_visual_inputs)
-
-        # 2. Encode action tokens from noisy action + proprio + timestep embedding
-        if proprio is None:
-            proprio_features = z_t.new_zeros((batch_size, self.dim_proprio))
-        else:
-            proprio_features = proprio
-        time_tokens = timestep_embedding(t, self.dim_time).to(dtype=z_t.dtype)
-        time_tokens = time_tokens.unsqueeze(1).expand(batch_size, num_actions, self.dim_time)
-        proprio_tokens = proprio_features.unsqueeze(1).expand(
-            batch_size, num_actions, proprio_features.shape[-1]
-        )
-        action_tokens = torch.cat([z_t, proprio_tokens, time_tokens], dim=-1)
-
-        action_features = self.action_encoder(action_tokens, domain_ids)  # [batch, chunk, hidden]
-
-        # 3. Build sequence: action + primary visual + aux visual
-        sequence = torch.cat([action_features, mm_features, aux_features], dim=1)
-
-        # 4. Add positional embedding
-        seq_len = sequence.shape[1]
-        if seq_len > self.pos_emb.shape[1]:
-            raise ValueError(
-                f"Sequence length {seq_len} exceeds max_len_seq={self.pos_emb.shape[1]}"
+            x = torch.cat(
+                [
+                    x,
+                    self.vlm_proj(vlm_features, domain_id),
+                    self.aux_visual_proj(aux_visual_inputs, domain_id),
+                ],
+                dim=1,
             )
-        sequence = sequence + self.pos_emb[:, :seq_len, :]
+        else:
+            x = torch.cat([x, self.vlm_proj(vlm_features), self.aux_visual_proj(aux_visual_inputs)], dim=1)
 
-        # 5. Append soft prompts
-        if self.soft_prompt_hub is not None:
-            soft_prompts = self.soft_prompt_hub(domain_ids)
-            soft_prompts = soft_prompts.view(batch_size, self.len_soft_prompts, self.hidden_size)
-            sequence = torch.cat([sequence, soft_prompts], dim=1)
+        # Add positional embeddings (truncate if needed)
+        seq_len = x.shape[1]
+        if seq_len > self.pos_emb.shape[1]:
+            raise ValueError(f"Sequence length {seq_len} exceeds max_len_seq={self.pos_emb.shape[1]}.")
+        x = x + self.pos_emb[:, :seq_len, :]
 
-        # 6. Transformer forward
+        # Append soft prompts
+        if self.len_soft_prompts > 0:
+            soft_prompts = self.soft_prompt_hub(domain_id).view(
+                batch_size, self.len_soft_prompts, self.hidden_size
+            )
+            x = torch.cat([x, soft_prompts], dim=1)
+
+        # Transformer backbone
         for block in self.blocks:
-            sequence = block(sequence)
+            x = block(x)
 
-        sequence = self.norm(sequence)
-
-        # 7. Decode action segment only
-        action_features = sequence[:, :num_actions, :]  # [batch, chunk, hidden]
-        vector_field = self.action_decoder(action_features, domain_ids)
-
-        if squeeze_actions:
-            vector_field = vector_field.squeeze(1)
-
-        return vector_field
-
-
-class ValueHead(nn.Module):
-    """Value head for PPO (optional)."""
-    
-    def __init__(self, input_dim: int, hidden_dim: int):
-        """Initialize value head.
-        
-        Args:
-            input_dim: Input dimension (Florence2 projection dim)
-            hidden_dim: Hidden dimension
-        """
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-        )
-    
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        """Predict value.
-        
-        Args:
-            features: Visual-language features [batch, input_dim]
-            
-        Returns:
-            Value estimate [batch, 1]
-        """
-        return self.net(features)
+        # Decode only the action segment
+        return self.action_decoder(self.norm(x[:, :num_actions]), domain_id)
