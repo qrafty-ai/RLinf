@@ -98,10 +98,11 @@ xvla:
     vocab_size: 51289
   
   # Tokenizer configuration
-  tokenizer_name: "facebook/bart-large"
-  tokenizer_max_length: 64
+  tokenizer_name: "facebook/bart-base"
+  tokenizer_max_length: 96
   tokenizer_padding_side: "right"
   pad_language_to: "max_length"
+  domain_id: 3 # libero
   
   # SoftPromptedTransformer policy head
   hidden_size: 1024
@@ -123,14 +124,14 @@ xvla:
   time_schedule: "lognorm"  # lognorm, uniform, cosine
   
   # Action space
-  action_mode: "ee7d"  # ee7d for LIBERO (7-DoF: 3 pos + 3 rot + 1 gripper)
-  max_action_dim: 7
+  action_mode: "ee6d"  # LeRobot/XVLA packed ee6d action format
+  max_action_dim: 20
   n_action_steps: 32
   
   # Observation settings
   num_images_in_input: 2
   use_proprio: true
-  max_state_dim: 32
+  max_state_dim: 20
   num_image_views: null
   empty_cameras: 0
   resize_imgs_with_padding: null

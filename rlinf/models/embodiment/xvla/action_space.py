@@ -49,9 +49,19 @@ class ActionSpace(ABC):
 
 
 class EE6DActionSpace(ActionSpace):
-    """6D end-effector pose action space.
-    
-    Actions: [x, y, z, roll, pitch, yaw] in normalized space [-1, 1]
+    """LeRobot/XVLA ee6d action space with packed 20D layout.
+
+    Internal XVLA action layout per timestep (20D):
+      [0:3]   position_1 (x, y, z)
+      [3:9]   rotation_6d_1
+      [9]     gripper_1 (logit)
+      [10:13] position_2 (x, y, z)
+      [13:19] rotation_6d_2
+      [19]    gripper_2 (logit)
+
+    For single-arm LIBERO handoff, we use arm-1 and convert to 7D:
+      [pos(3), axis_angle(3), gripper(1)]
+    where gripper is discretized to {-1, +1}.
     """
     
     def __init__(
@@ -59,28 +69,85 @@ class EE6DActionSpace(ActionSpace):
         pos_bounds: tuple[float, float] = (-1.0, 1.0),
         rot_bounds: tuple[float, float] = (-1.0, 1.0),
     ):
-        super().__init__(action_dim=6)
+        super().__init__(action_dim=20)
         self.pos_bounds = pos_bounds
         self.rot_bounds = rot_bounds
+
+        # Packed indices (LeRobot xvla/action_hub.py compatible)
+        self.pos_idx_1 = slice(0, 3)
+        self.rot_idx_1 = slice(3, 9)
+        self.gripper_idx_1 = 9
+        self.pos_idx_2 = slice(10, 13)
+        self.rot_idx_2 = slice(13, 19)
+        self.gripper_idx_2 = 19
     
     def preprocess(self, action: np.ndarray | torch.Tensor) -> torch.Tensor:
-        """Normalize action to [-1, 1]."""
+        """Preprocess actions to packed 20D ee6d format.
+
+        Accepts either:
+        - 20D packed ee6d actions (pass-through), or
+        - 7D LIBERO actions [pos(3), axis_angle(3), gripper(1)] and packs to 20D.
+        """
         if isinstance(action, np.ndarray):
             action = torch.from_numpy(action).float()
-        
-        # Assume input is already in normalized space for training
-        # In practice, you might denormalize based on dataset stats
-        return action
+
+        if action.shape[-1] == 20:
+            return action
+
+        if action.shape[-1] != 7:
+            raise ValueError(f"EE6DActionSpace expects last dim 7 or 20, got {action.shape[-1]}")
+
+        from rlinf.models.embodiment.xvla.rotation_utils import axis_angle_to_rotation_6d
+
+        pos = torch.clamp(action[..., 0:3], -1.0, 1.0)
+        axis_angle = action[..., 3:6]
+        rot6d = axis_angle_to_rotation_6d(axis_angle)
+        gripper = action[..., 6:7]
+
+        # Convert {-1,+1} or [0,1] to logit-like scalar for packed representation.
+        # Keep simple bounded value in [-1,1] for compatibility.
+        gripper = torch.clamp(gripper, -1.0, 1.0)
+
+        arm1 = torch.cat([pos, rot6d, gripper], dim=-1)  # 10D
+        arm2 = torch.zeros_like(arm1)
+        return torch.cat([arm1, arm2], dim=-1)  # 20D
     
     def postprocess(self, action: torch.Tensor) -> np.ndarray:
-        """Convert to numpy and clip."""
-        action = torch.clamp(action, -1.0, 1.0)
-        return action.detach().cpu().numpy()
+        """Convert packed 20D ee6d output to LIBERO-compatible 7D.
+
+        Input shapes supported:
+        - [B, T, 20]
+        - [B, 20]
+
+        Output:
+        - [B, T, 7] or [B, 7]
+          [pos(3), axis_angle(3), gripper in (0,1)]
+        
+        Matches LeRobot ee6d action space: gripper is sigmoid(logit) -> continuous (0, 1).
+        """
+        from rlinf.models.embodiment.xvla.rotation_utils import rotation_6d_to_axis_angle
+
+        if action.shape[-1] != 20:
+            raise ValueError(f"EE6DActionSpace.postprocess expects last dim 20, got {action.shape[-1]}")
+
+        # Arm-1 extraction for single-arm LIBERO
+        pos = torch.clamp(action[..., self.pos_idx_1], -1.0, 1.0)
+        rot6d = action[..., self.rot_idx_1]
+        gripper_logit = action[..., self.gripper_idx_1 : self.gripper_idx_1 + 1]
+
+        axis_angle = rotation_6d_to_axis_angle(rot6d)
+        axis_angle = torch.clamp(axis_angle, -1.0, 1.0)
+
+        # LeRobot convention: sigmoid -> continuous (0, 1)
+        gripper = torch.sigmoid(gripper_logit)
+
+        out = torch.cat([pos, axis_angle, gripper], dim=-1)
+        return out.detach().cpu().numpy()
     
     def get_bounds(self) -> tuple[np.ndarray, np.ndarray]:
-        """Get normalized bounds."""
-        low = np.array([-1.0] * 6)
-        high = np.array([1.0] * 6)
+        """Get bounds for packed 20D representation."""
+        low = np.array([-1.0] * 20)
+        high = np.array([1.0] * 20)
         return low, high
 
 

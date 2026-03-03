@@ -33,7 +33,6 @@ from rlinf.models.embodiment.xvla.soft_transformer import (
     ValueHead,
 )
 from rlinf.models.embodiment.xvla.action_space import ActionHub
-from rlinf.models.embodiment.xvla.flow_matching import FlowMatchingSampler
 from rlinf.utils.logging import get_logger
 
 # Import custom Florence2 implementation (not from transformers to avoid dependency issues)
@@ -76,8 +75,6 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         
         # 3. Initialize SoftPromptedTransformer policy head
         projection_dim = florence_config.projection_dim
-        # Policy head expects full action chunk, not single action
-        total_action_dim = config.chunk_size * config.max_action_dim
         self.policy_head = SoftPromptedTransformer(
             hidden_size=config.hidden_size,
             multi_modal_input_size=projection_dim,
@@ -87,23 +84,16 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
             num_domains=config.num_domains,
             len_soft_prompts=config.len_soft_prompts,
             dim_time=config.dim_time,
-            dim_action=total_action_dim,
+            dim_action=config.max_action_dim,
             dim_proprio=proprio_dim,
+            max_len_seq=config.max_len_seq,
+            use_hetero_proj=config.use_hetero_proj,
         )
         
         # 4. Action space for preprocessing/postprocessing
         self.action_space = ActionHub.build(config.action_mode)
         
-        # 5. Flow-matching sampler
-        self.flow_sampler = FlowMatchingSampler(
-            num_steps=config.num_steps,
-            sigma_min=config.sigma_min,
-            sigma_max=config.sigma_max,
-            rho=config.rho,
-            time_schedule=config.time_schedule,
-        )
-        
-        # 6. Optional value head for PPO
+        # 5. Optional value head for PPO
         if config.add_value_head:
             self.value_head = ValueHead(
                 input_dim=projection_dim,
@@ -112,10 +102,10 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         else:
             self.value_head = None
         
-        # 7. Apply freezing
+        # 6. Apply freezing
         self._apply_freezing()
         
-        # 8. Initialize BART tokenizer for language instructions
+        # 7. Initialize BART tokenizer for language instructions
         self.tokenizer = BartTokenizerFast.from_pretrained(
             config.tokenizer_name,
             padding_side=config.tokenizer_padding_side,
@@ -194,11 +184,10 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         """Parameter names that should not be split."""
         return [
             # Action projections
-            "action_in_proj",
-            "action_out_proj",
-            # Time embeddings
-            "time_mlp_in",
-            "time_mlp_out",
+            "action_encoder",
+            "action_decoder",
+            "vlm_proj",
+            "aux_visual_proj",
             # Soft prompts
             "soft_prompts",
             "soft_prompt_hub",
@@ -211,7 +200,7 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> dict[str, torch.Tensor]:
         """Get visual-language features from Florence2.
         
         Args:
@@ -220,32 +209,37 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
             attention_mask: Attention mask [batch, seq_len]
             
         Returns:
-            Visual-language features [batch, seq_len, projection_dim]
+            Dictionary with:
+                - vlm_features: [batch, seq_len, projection_dim]
+                - aux_visual_inputs: [batch, seq_aux, projection_dim]
         """
         if not hasattr(self, "_debug_vlm_shapes_logged"):
             self._debug_vlm_shapes_logged = True
             self.logger.info(f"_get_vlm_features pixel_values shape: {tuple(pixel_values.shape)}")
             self.logger.info(f"_get_vlm_features input_ids shape: {tuple(input_ids.shape)}")
 
-        # pixel_values shape: [batch, num_images, C, H, W]
-        # Florence2 custom implementation expects 4D image tensor, so we use
-        # the first view for now to keep compatibility and stability.
-        if pixel_values.dim() == 5:
-            pixel_values = pixel_values[:, 0]
+        if pixel_values.dim() == 4:
+            pixel_values = pixel_values.unsqueeze(1)
 
-        # Encode image tokens with Florence2 custom image encoder
-        image_features = self.vlm._encode_image(pixel_values)
+        batch_size, num_views = pixel_values.shape[:2]
+        flat_images = pixel_values.reshape(batch_size * num_views, *pixel_values.shape[2:])
+
+        # Encode all views then restore [B, V, T, C]
+        image_features = self.vlm._encode_image(flat_images)
+        image_tokens = image_features.shape[1]
+        feature_dim = image_features.shape[2]
+        image_features = image_features.reshape(batch_size, num_views, image_tokens, feature_dim)
 
         # Get text token embeddings
         text_embeds = self.vlm.get_input_embeddings()(input_ids)
 
         # Merge image and text tokens and attention masks
         combined_embeds, combined_attention_mask = self.vlm._merge_input_ids_with_image_features(
-            image_features,
+            image_features[:, 0],
             text_embeds,
         )
         if attention_mask is not None:
-            combined_attention_mask[:, image_features.shape[1] :] = attention_mask
+            combined_attention_mask[:, image_tokens:] = attention_mask
 
         # Run encoder-only path
         encoder_outputs = self.vlm.language_model.model.encoder(
@@ -253,7 +247,12 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
             attention_mask=combined_attention_mask,
         )
 
-        return encoder_outputs.last_hidden_state
+        aux_visual_inputs = image_features[:, 1:].reshape(batch_size, -1, feature_dim)
+
+        return {
+            "vlm_features": encoder_outputs.last_hidden_state,
+            "aux_visual_inputs": aux_visual_inputs,
+        }
     
     def forward(
         self,
@@ -293,12 +292,15 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         input_ids = observations["input_ids"]
         attention_mask = observations["attention_mask"]
         
-        vlm_features = self._get_vlm_features(pixel_values, input_ids, attention_mask)
+        feature_dict = self._get_vlm_features(pixel_values, input_ids, attention_mask)
+        vlm_features = feature_dict["vlm_features"]
+        aux_visual_inputs = feature_dict["aux_visual_inputs"]
         
+        if actions.shape[-1] != self.config.max_action_dim:
+            actions = self.action_space.preprocess(actions).to(actions.device)
+
         # Compute flow-matching loss
-        # For SFT, we train the policy head to predict the flow
         batch_size = actions.shape[0]
-        action_dim = actions.shape[-1]
         
         # Sample time
         t = torch.rand(batch_size, device=actions.device)
@@ -315,14 +317,19 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         
         # Predict vector field
         proprio = observations.get("proprio", None)
+        domain_ids = observations.get("domain_id", None)
+        if domain_ids is None:
+            domain_ids = torch.full(
+                (batch_size,), self.config.domain_id, dtype=torch.long, device=actions.device
+            )
         v_t = self.policy_head(
-            z_t=z_t.reshape(batch_size, -1),  # Flatten action chunk
+            z_t=z_t,
             t=t,
             multi_modal_features=vlm_features,
+            aux_visual_inputs=aux_visual_inputs,
             proprio=proprio,
+            domain_ids=domain_ids,
         )
-        
-        v_t = v_t.reshape_as(actions)
         
         # MSE loss
         loss = F.mse_loss(v_t, u_t)
@@ -361,7 +368,14 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         attention_mask = observations["attention_mask"]
         proprio = observations.get("proprio", None)
         
-        vlm_features = self._get_vlm_features(pixel_values, input_ids, attention_mask)
+        feature_dict = self._get_vlm_features(pixel_values, input_ids, attention_mask)
+        vlm_features = feature_dict["vlm_features"]
+        aux_visual_inputs = feature_dict["aux_visual_inputs"]
+        domain_ids = observations.get("domain_id", None)
+        if domain_ids is None:
+            domain_ids = torch.full(
+                (batch_size,), self.config.domain_id, dtype=torch.long, device=chains.device
+            )
         
         # Compute log-probs by evaluating the flow at each timestep
         logprobs_list = []
@@ -369,19 +383,15 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
             z_t = chains[:, i]  # [batch, action_chunk, action_dim]
             t = timesteps[:, i]  # [batch]
             
-            # Flatten action for policy head
-            z_t_flat = z_t.reshape(batch_size, -1)
-            
             # Predict vector field
             v_t = self.policy_head(
-                z_t=z_t_flat,
+                z_t=z_t,
                 t=t,
                 multi_modal_features=vlm_features,
+                aux_visual_inputs=aux_visual_inputs,
                 proprio=proprio,
+                domain_ids=domain_ids,
             )
-            
-            # Reshape back
-            v_t = v_t.reshape_as(z_t)
             
             # Log-prob is related to the vector field magnitude
             # For simplicity, use negative squared error
@@ -393,8 +403,7 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         # Compute values if value head exists
         values = None
         if self.value_head is not None:
-            # Pool VLM features
-            pooled_features = vlm_features.mean(dim=1)  # [batch, hidden_dim]
+            pooled_features = vlm_features.mean(dim=1)
             values = self.value_head(pooled_features).squeeze(-1)  # [batch]
         
         # Compute entropy (simplified)
@@ -436,33 +445,46 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         attention_mask = transformed_obs["attention_mask"]
         proprio = transformed_obs.get("proprio", None)
         
+        domain_ids = transformed_obs.get("domain_id", None)
+        if domain_ids is None:
+            domain_ids = torch.full(
+                (pixel_values.shape[0],), self.config.domain_id, dtype=torch.long, device=pixel_values.device
+            )
+
         with torch.no_grad():
-            vlm_features = self._get_vlm_features(pixel_values, input_ids, attention_mask)
+            feature_dict = self._get_vlm_features(pixel_values, input_ids, attention_mask)
+            vlm_features = feature_dict["vlm_features"]
+            aux_visual_inputs = feature_dict["aux_visual_inputs"]
         
-        # Sample actions using flow-matching
+        # LeRobot-compatible iterative denoising
         batch_size = pixel_values.shape[0]
-        action_dim = self.config.max_action_dim * self.config.chunk_size
         device = pixel_values.device
-        
-        def vector_field_fn(z_t: torch.Tensor, t: torch.Tensor, cond=None) -> torch.Tensor:
-            """Vector field function for flow-matching."""
-            return self.policy_head(
-                z_t=z_t,
+        actions = torch.zeros(
+            batch_size,
+            self.config.chunk_size,
+            self.config.max_action_dim,
+            device=device,
+            dtype=vlm_features.dtype,
+        )
+        x1 = torch.randn_like(actions)
+
+        for i in range(self.config.num_steps, 0, -1):
+            t = torch.full(
+                (batch_size,),
+                float(i) / float(self.config.num_steps),
+                device=device,
+                dtype=actions.dtype,
+            )
+            t_expanded = t.view(-1, 1, 1)
+            x_t = x1 * t_expanded + actions * (1.0 - t_expanded)
+            actions = self.policy_head(
+                z_t=x_t,
                 t=t,
                 multi_modal_features=vlm_features,
+                aux_visual_inputs=aux_visual_inputs,
                 proprio=proprio,
+                domain_ids=domain_ids,
             )
-        
-        # Sample using flow-matching
-        actions_flat = self.flow_sampler.sample(
-            vector_field_fn=vector_field_fn,
-            batch_size=batch_size,
-            action_dim=action_dim,
-            device=device,
-        )
-        
-        # Reshape to [batch, action_chunk, action_dim]
-        actions = actions_flat.reshape(batch_size, self.config.chunk_size, -1)
         
         # Postprocess
         actions_np = self.action_space.postprocess(actions)
@@ -517,6 +539,12 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
             "input_ids": lang_tokens,
             "attention_mask": lang_masks,
             "proprio": state if self.proprio_dim > 0 else None,
+            "domain_id": torch.full(
+                (lang_tokens.shape[0],),
+                self.config.domain_id,
+                dtype=torch.long,
+                device=lang_tokens.device,
+            ),
         }
         
         forward_inputs = {
@@ -568,41 +596,25 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
             Dictionary with pixel_values, input_ids, attention_mask, proprio, domain_id
         """
         device = next(self.parameters()).device
+
+        self.logger.info(f"env_obs keys: {list(env_obs.keys())}")
         
         # === Step 1: Extract and process images ===
-        if "images" in env_obs:
-            images = env_obs["images"]
-        elif "main_images" in env_obs:
-            # LIBERO format: main_images and wrist_images
-            images = [env_obs["main_images"]]
-            if "wrist_images" in env_obs:
-                images.append(env_obs["wrist_images"])
-        elif "main_image" in env_obs:
-            images = [env_obs["main_image"]]
-            if "wrist_image" in env_obs:
-                images.append(env_obs["wrist_image"])
-        else:
-            raise ValueError(f"No images found in observation. Keys: {list(env_obs.keys())}")
-        
+        image_keys = [key for key in env_obs.keys() if "image" in key]
+        images: list = []
+        for key in image_keys:
+            self.logger.info(f"Image key: {key}, type: {type(env_obs[key])}, shape: {getattr(env_obs[key], 'shape', 'N/A')}")
+            if env_obs[key] is not None:
+               images.append(env_obs[key])
+
         # Infer batch size from images
-        if isinstance(images[0], torch.Tensor):
-            batch_size = images[0].shape[0]
-        elif isinstance(images[0], np.ndarray):
+        if isinstance(images[0], torch.Tensor) or isinstance(images[0], np.ndarray):
             batch_size = images[0].shape[0]
         else:
             batch_size = 1
 
-        if not hasattr(self, "_debug_input_transform_logged"):
-            self._debug_input_transform_logged = True
-            first_shape = tuple(images[0].shape) if hasattr(images[0], "shape") else type(images[0])
-            self.logger.info(f"input_transform first image shape: {first_shape}")
-        
         # Stack images and normalize tensor layout to [batch, num_views, 3, H, W]
-        if isinstance(images[0], torch.Tensor):
-            pixel_values = torch.stack(images, dim=1)
-        else:
-            pixel_values = torch.from_numpy(np.stack(images, axis=0)).float()
-            pixel_values = pixel_values.unsqueeze(1)
+        pixel_values = torch.stack(images, dim=1)
 
         # Handle channel-last inputs, e.g. [B, V, H, W, 3] -> [B, V, 3, H, W]
         if pixel_values.dim() == 5 and pixel_values.shape[-1] == 3:
@@ -622,10 +634,11 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
             ).unflatten(0, (batch_size, -1))
 
         # Ensure image tensor is on the same device as model weights
+        assert pixel_values.shape == (batch_size, len(images), 3, 224, 224), f"Unexpected pixel_values shape: {pixel_values.shape}"
         pixel_values = pixel_values.to(device)
         
         # === Step 2: Extract and tokenize language ===
-        task_desc = env_obs.get("task_descriptions", env_obs.get("language_instruction", ""))
+        task_desc = env_obs["task_descriptions"]
         if isinstance(task_desc, str):
             task_desc = [task_desc] * batch_size
         
@@ -640,7 +653,7 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         attention_mask = tokenized.attention_mask.to(device)
         
         # === Step 3: Extract and process proprioception ===
-        state = env_obs.get("states", env_obs.get("agent_pos", None))
+        state = env_obs["states"]
         
         if state is not None and self.proprio_dim > 0:
             if isinstance(state, np.ndarray):
@@ -728,7 +741,10 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         
         for key, value in processed_obs.items():
             if isinstance(value, torch.Tensor):
-                processed_obs[key] = value.to(dtype=dtype, device=device)
+                if key in {"input_ids", "attention_mask", "domain_id"}:
+                    processed_obs[key] = value.to(device=device)
+                else:
+                    processed_obs[key] = value.to(dtype=dtype, device=device)
         
         return processed_obs
     
@@ -739,8 +755,6 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
             checkpoint_path: Path to checkpoint file (.safetensors or .bin)
             strict: Whether to strictly enforce matching keys
         """
-        import os
-        
         if checkpoint_path.endswith(".safetensors"):
             try:
                 from safetensors.torch import load_file
@@ -749,13 +763,95 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
                 raise ImportError("safetensors is required to load .safetensors files")
         else:
             state_dict = torch.load(checkpoint_path, map_location="cpu")
-        
-        # Load state dict
-        missing_keys, unexpected_keys = self.load_state_dict(state_dict, strict=strict)
-        
-        if missing_keys:
-            self.logger.warning(f"Missing keys: {missing_keys}")
-        if unexpected_keys:
-            self.logger.warning(f"Unexpected keys: {unexpected_keys}")
-        
+
+        remapped_state_dict: dict[str, torch.Tensor] = {}
+        model_state_dict = self.state_dict()
+
+        alias_map = {
+            "policy_head.action_in_proj.weight": "policy_head.action_encoder.fc.weight",
+            "policy_head.action_in_proj.bias": "policy_head.action_encoder.bias.weight",
+            "policy_head.action_out_proj.weight": "policy_head.action_decoder.fc.weight",
+            "policy_head.action_out_proj.bias": "policy_head.action_decoder.bias.weight",
+            "policy_head.input_proj.weight": "policy_head.vlm_proj.weight",
+            "policy_head.input_proj.bias": "policy_head.vlm_proj.bias",
+            "policy_head.soft_prompt_hub.soft_prompts": "policy_head.soft_prompt_hub.weight",
+        }
+
+        def _map_key(key: str) -> str | None:
+            mapped = key
+            if mapped.startswith("model."):
+                mapped = mapped[6:]
+                if mapped.startswith("transformer."):
+                    mapped = "policy_head." + mapped[len("transformer.") :]
+
+            mapped = alias_map.get(mapped, mapped)
+
+            if ".mlp.3." in mapped:
+                mapped = mapped.replace(".mlp.3.", ".mlp.2.")
+
+            if mapped.startswith("policy_head.action_encoder.bias") and mapped != "policy_head.action_encoder.bias.weight":
+                mapped = mapped.replace("policy_head.action_encoder.bias", "policy_head.action_encoder.bias.weight")
+            if mapped.startswith("policy_head.action_decoder.bias") and mapped != "policy_head.action_decoder.bias.weight":
+                mapped = mapped.replace("policy_head.action_decoder.bias", "policy_head.action_decoder.bias.weight")
+            if mapped.startswith("policy_head.vlm_proj.bias") and mapped.endswith(".weight"):
+                mapped = mapped.replace("policy_head.vlm_proj.bias.weight", "policy_head.vlm_proj.bias")
+
+            if mapped == "policy_head.soft_prompt_hub.soft_prompts":
+                mapped = "policy_head.soft_prompt_hub.weight"
+
+            return mapped
+
+        shape_mismatch: list[tuple[str, torch.Size, torch.Size]] = []
+        unexpected_source: list[str] = []
+
+        for key, value in state_dict.items():
+            new_key = _map_key(key)
+            if new_key is None:
+                continue
+
+            if new_key == "policy_head.soft_prompt_hub.weight" and value.dim() == 3:
+                value = value.reshape(value.shape[0], -1)
+
+            if new_key in model_state_dict:
+                expected_shape = model_state_dict[new_key].shape
+                if value.shape != expected_shape:
+                    shape_mismatch.append((new_key, value.shape, expected_shape))
+                    continue
+
+                remapped_state_dict[new_key] = value
+            else:
+                unexpected_source.append(key)
+
+        # Fill shared embedding when only encoder embedding exists in checkpoint.
+        shared_key = "vlm.language_model.model.shared.weight"
+        encoder_embed_key = "vlm.language_model.model.encoder.embed_tokens.weight"
+        if shared_key in model_state_dict and shared_key not in remapped_state_dict:
+            if encoder_embed_key in remapped_state_dict:
+                remapped_state_dict[shared_key] = remapped_state_dict[encoder_embed_key]
+
+        if shape_mismatch:
+            preview = ", ".join(
+                [f"{name}: ckpt={tuple(src)} model={tuple(dst)}" for name, src, dst in shape_mismatch[:5]]
+            )
+            raise RuntimeError(
+                f"Checkpoint has shape mismatches for {len(shape_mismatch)} parameters. {preview}"
+            )
+
+        missing_keys, unexpected_keys = self.load_state_dict(remapped_state_dict, strict=strict)
+
+        if strict and (missing_keys or unexpected_keys):
+            raise RuntimeError(
+                f"Strict load failed. Missing={len(missing_keys)} Unexpected={len(unexpected_keys)}"
+            )
+
+        if unexpected_source:
+            self.logger.warning(
+                "Ignored %d source keys that do not map to model parameters",
+                len(unexpected_source),
+            )
+
         self.logger.info(f"Loaded checkpoint from {checkpoint_path}")
+
+        loaded_count = len(remapped_state_dict)
+        total_count = len(model_state_dict)
+        self.logger.info(f"Loaded {loaded_count}/{total_count} parameters ({100*loaded_count//total_count}%)")

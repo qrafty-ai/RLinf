@@ -139,6 +139,15 @@ class Florence2LanguageConfig(PretrainedConfig):
         self.init_std = init_std
         
         self.use_cache = use_cache
+
+        # Keep compatibility with newer transformers where num_labels property
+        # expects id2label/label2id to exist.
+        if "id2label" not in kwargs:
+            kwargs["id2label"] = {i: str(i) for i in range(num_labels)}
+        if "label2id" not in kwargs:
+            kwargs["label2id"] = {str(i): i for i in range(num_labels)}
+        self.id2label = kwargs["id2label"]
+        self.label2id = kwargs["label2id"]
         self.num_labels = num_labels
         
         self.pad_token_id = pad_token_id

@@ -25,7 +25,97 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from rlinf.models.embodiment.xvla.flow_matching import TimeEmbedding
+def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 100) -> torch.Tensor:
+    """Create sinusoidal timestep embeddings.
+
+    Args:
+        t: Timesteps [batch]
+        dim: Output embedding dimension
+        max_period: Controls minimum frequency
+
+    Returns:
+        Embeddings [batch, dim]
+    """
+    half = dim // 2
+    freqs = torch.exp(
+        -math.log(max_period)
+        * torch.arange(start=0, end=half, dtype=t.dtype, device=t.device)
+        / half
+    )
+    args = t[:, None] * freqs[None]
+    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2 == 1:
+        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+    return embedding
+
+
+class DomainAwareLinear(nn.Module):
+    """Per-domain linear projection.
+    
+    Stores separate weights for each domain, enabling domain-specific
+    transformations. Used for action encoder/decoder in LeRobot XVLA.
+    
+    Weight shape: [num_domains, input_size * output_size] (flattened per-domain weights)
+    Bias shape: [num_domains, output_size]
+    """
+    
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        num_domains: int = 30,
+    ):
+        """Initialize domain-aware linear.
+        
+        Args:
+            input_size: Input feature dimension
+            output_size: Output feature dimension
+            num_domains: Number of domains
+        """
+        super().__init__()
+        self.input_size = input_size
+        self.output_size = output_size
+        self.num_domains = num_domains
+        
+        # Per-domain weights stored as flattened [num_domains, input_size * output_size]
+        # This matches LeRobot checkpoint format
+        self.fc = nn.Embedding(num_domains, input_size * output_size)
+        self.bias = nn.Embedding(num_domains, output_size)
+        
+        # Initialize
+        nn.init.xavier_uniform_(self.fc.weight)
+        nn.init.zeros_(self.bias.weight)
+    
+    def forward(self, x: torch.Tensor, domain_id: torch.Tensor) -> torch.Tensor:
+        """Forward pass with domain-specific weights.
+        
+        Args:
+            x: Input tensor [batch, ..., input_size]
+            domain_id: Domain indices [batch]
+            
+        Returns:
+            Output tensor [batch, ..., output_size]
+        """
+        # Handle sequence input
+        squeeze_seq = False
+        if x.dim() == 2:
+            x = x.unsqueeze(1)  # [batch, 1, input_size]
+            squeeze_seq = True
+        
+        batch_size, seq_len, _ = x.shape
+        
+        # Get per-domain weights and biases
+        weight = self.fc(domain_id).view(batch_size, self.input_size, self.output_size)
+        bias = self.bias(domain_id).view(batch_size, self.output_size)
+        
+        # Apply linear transformation with domain-specific weights
+        # x: [batch, seq, input_size], weight: [batch, input_size, output_size]
+        y = torch.matmul(x, weight) + bias.unsqueeze(1)  # [batch, seq, output_size]
+        
+        if squeeze_seq:
+            y = y.squeeze(1)
+        
+        return y
 
 
 class SoftPromptHub(nn.Module):
@@ -103,7 +193,7 @@ class MultiHeadAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
         
-        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.qkv = nn.Linear(dim, 3 * dim, bias=True)
         self.proj = nn.Linear(dim, dim)
         self.dropout = nn.Dropout(dropout)
     
@@ -172,9 +262,7 @@ class TransformerBlock(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(dim, mlp_dim),
             nn.GELU(),
-            nn.Dropout(dropout),
             nn.Linear(mlp_dim, dim),
-            nn.Dropout(dropout),
         )
     
     def forward(
@@ -193,6 +281,10 @@ class SoftPromptedTransformer(nn.Module):
     
     This is the core policy network that predicts flow-matching vector fields
     for action generation, conditioned on visual-language features and domain.
+    
+    Supports LeRobot-compatible architecture:
+    - Action encoder/decoder are always domain-aware
+    - VLM/aux projections are optionally domain-aware (use_hetero_proj)
     """
     
     def __init__(
@@ -207,7 +299,9 @@ class SoftPromptedTransformer(nn.Module):
         dim_proprio: int = 0,
         len_soft_prompts: int = 32,
         dim_time: int = 32,
-        dropout: float = 0.0,
+        max_len_seq: int = 512,
+        dropout: float = 0.1,
+        use_hetero_proj: bool = False,
     ):
         """Initialize transformer.
         
@@ -223,46 +317,59 @@ class SoftPromptedTransformer(nn.Module):
             len_soft_prompts: Length of soft prompt sequence
             dim_time: Time embedding dimension
             dropout: Dropout rate
+            max_len_seq: Maximum sequence length for positional embeddings
+            use_hetero_proj: Use per-domain visual projections
         """
         super().__init__()
         
         self.hidden_size = hidden_size
         self.dim_action = dim_action
         self.dim_proprio = dim_proprio
-        
-        # Project multi-modal input to hidden size
-        self.input_proj = nn.Linear(multi_modal_input_size, hidden_size)
-        
-        # Time embedding
-        self.time_embed = nn.Sequential(
-            TimeEmbedding(dim_time),
-            nn.Linear(dim_time, hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size),
+        self.dim_time = dim_time
+        self.len_soft_prompts = len_soft_prompts
+        self.use_hetero_proj = use_hetero_proj
+        self.max_len_seq = max_len_seq
+
+        # Visual projections (LeRobot naming)
+        if use_hetero_proj:
+            self.vlm_proj = DomainAwareLinear(
+                multi_modal_input_size, hidden_size, num_domains=num_domains
+            )
+            self.aux_visual_proj = DomainAwareLinear(
+                multi_modal_input_size, hidden_size, num_domains=num_domains
+            )
+        else:
+            self.vlm_proj = nn.Linear(multi_modal_input_size, hidden_size)
+            self.aux_visual_proj = nn.Linear(multi_modal_input_size, hidden_size)
+
+        # Learned positional embeddings (LeRobot)
+        self.pos_emb = nn.Parameter(torch.zeros(1, max_len_seq, hidden_size), requires_grad=True)
+        nn.init.normal_(self.pos_emb, std=0.02)
+
+        # Action encoder/decoder are domain-aware in LeRobot
+        total_action_dim = dim_action + dim_proprio + dim_time
+        self.action_encoder = DomainAwareLinear(
+            total_action_dim, hidden_size, num_domains=num_domains
         )
-        
-        # Action input projection
-        total_action_dim = dim_action + dim_proprio
-        self.action_in_proj = nn.Linear(total_action_dim, hidden_size)
-        
-        # Soft prompt hub for domain conditioning
-        self.soft_prompt_hub = SoftPromptHub(
-            num_domains=num_domains,
-            len_soft_prompts=len_soft_prompts,
-            dim=hidden_size,
+        self.action_decoder = DomainAwareLinear(
+            hidden_size, dim_action, num_domains=num_domains
         )
-        
+
+        # Domain soft prompts
+        if len_soft_prompts > 0:
+            self.soft_prompt_hub = nn.Embedding(num_domains, len_soft_prompts * hidden_size)
+            nn.init.normal_(self.soft_prompt_hub.weight, std=0.02)
+        else:
+            self.soft_prompt_hub = None
+
         # Transformer blocks
         self.blocks = nn.ModuleList([
             TransformerBlock(hidden_size, num_heads, mlp_ratio, dropout)
             for _ in range(depth)
         ])
-        
+
         self.norm = nn.LayerNorm(hidden_size)
-        
-        # Action output projection (predicts vector field)
-        self.action_out_proj = nn.Linear(hidden_size, dim_action)
-        
+
         self._init_weights()
     
     def _init_weights(self):
@@ -278,61 +385,93 @@ class SoftPromptedTransformer(nn.Module):
         z_t: torch.Tensor,
         t: torch.Tensor,
         multi_modal_features: torch.Tensor,
+        aux_visual_inputs: Optional[torch.Tensor] = None,
         proprio: Optional[torch.Tensor] = None,
         domain_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Predict vector field for flow-matching.
         
         Args:
-            z_t: Current noisy action [batch, action_dim]
+            z_t: Current noisy action [batch, action_dim] or [batch, chunk, action_dim]
             t: Time [batch]
             multi_modal_features: Visual-language features [batch, seq, dim]
+            aux_visual_inputs: Additional visual tokens [batch, seq_aux, dim] or None
             proprio: Proprioception [batch, dim_proprio] or None
             domain_ids: Domain indices [batch] or None
             
         Returns:
-            Predicted vector field [batch, action_dim]
+            Predicted vector field [batch, action_dim] or [batch, chunk, action_dim]
         """
         batch_size = z_t.shape[0]
+
+        squeeze_actions = False
+        if z_t.dim() == 2:
+            z_t = z_t.unsqueeze(1)
+            squeeze_actions = True
+
+        _, num_actions, _ = z_t.shape
         
-        # 1. Get soft prompts for domain
-        soft_prompts = self.soft_prompt_hub(domain_ids, batch_size=batch_size)  # [batch, len_soft_prompts, hidden]
+        # Default domain_ids to 0 if not provided
+        if domain_ids is None:
+            domain_ids = torch.zeros(batch_size, dtype=torch.long, device=z_t.device)
         
-        # 2. Project multi-modal features
-        mm_features = self.input_proj(multi_modal_features)  # [batch, seq, hidden]
-        
-        # 3. Time embedding
-        t_embed = self.time_embed(t)  # [batch, hidden]
-        
-        # 4. Action embedding (with proprio if available)
-        if proprio is not None and self.dim_proprio > 0:
-            z_input = torch.cat([z_t, proprio], dim=-1)
+        # 1. Prepare visual features
+        if aux_visual_inputs is None:
+            aux_visual_inputs = multi_modal_features.new_zeros(
+                batch_size, 0, multi_modal_features.shape[-1]
+            )
+
+        if self.use_hetero_proj:
+            mm_features = self.vlm_proj(multi_modal_features, domain_ids)
+            aux_features = self.aux_visual_proj(aux_visual_inputs, domain_ids)
         else:
-            z_input = z_t
-        z_embed = self.action_in_proj(z_input)  # [batch, hidden]
-        
-        # 5. Build sequence: [soft_prompts, mm_features, time_embed, action_embed]
-        # Expand time and action to sequence length 1
-        t_embed = t_embed.unsqueeze(1)  # [batch, 1, hidden]
-        z_embed = z_embed.unsqueeze(1)  # [batch, 1, hidden]
-        
-        sequence = torch.cat([
-            soft_prompts,     # [batch, len_soft_prompts, hidden]
-            mm_features,      # [batch, seq, hidden]
-            t_embed,          # [batch, 1, hidden]
-            z_embed,          # [batch, 1, hidden]
-        ], dim=1)  # [batch, len_soft_prompts + seq + 2, hidden]
-        
+            mm_features = self.vlm_proj(multi_modal_features)
+            aux_features = self.aux_visual_proj(aux_visual_inputs)
+
+        # 2. Encode action tokens from noisy action + proprio + timestep embedding
+        if proprio is None:
+            proprio_features = z_t.new_zeros((batch_size, self.dim_proprio))
+        else:
+            proprio_features = proprio
+        time_tokens = timestep_embedding(t, self.dim_time).to(dtype=z_t.dtype)
+        time_tokens = time_tokens.unsqueeze(1).expand(batch_size, num_actions, self.dim_time)
+        proprio_tokens = proprio_features.unsqueeze(1).expand(
+            batch_size, num_actions, proprio_features.shape[-1]
+        )
+        action_tokens = torch.cat([z_t, proprio_tokens, time_tokens], dim=-1)
+
+        action_features = self.action_encoder(action_tokens, domain_ids)  # [batch, chunk, hidden]
+
+        # 3. Build sequence: action + primary visual + aux visual
+        sequence = torch.cat([action_features, mm_features, aux_features], dim=1)
+
+        # 4. Add positional embedding
+        seq_len = sequence.shape[1]
+        if seq_len > self.pos_emb.shape[1]:
+            raise ValueError(
+                f"Sequence length {seq_len} exceeds max_len_seq={self.pos_emb.shape[1]}"
+            )
+        sequence = sequence + self.pos_emb[:, :seq_len, :]
+
+        # 5. Append soft prompts
+        if self.soft_prompt_hub is not None:
+            soft_prompts = self.soft_prompt_hub(domain_ids)
+            soft_prompts = soft_prompts.view(batch_size, self.len_soft_prompts, self.hidden_size)
+            sequence = torch.cat([sequence, soft_prompts], dim=1)
+
         # 6. Transformer forward
         for block in self.blocks:
             sequence = block(sequence)
-        
+
         sequence = self.norm(sequence)
-        
-        # 7. Extract action output (last position)
-        action_features = sequence[:, -1, :]  # [batch, hidden]
-        vector_field = self.action_out_proj(action_features)  # [batch, action_dim]
-        
+
+        # 7. Decode action segment only
+        action_features = sequence[:, :num_actions, :]  # [batch, chunk, hidden]
+        vector_field = self.action_decoder(action_features, domain_ids)
+
+        if squeeze_actions:
+            vector_field = vector_field.squeeze(1)
+
         return vector_field
 
 

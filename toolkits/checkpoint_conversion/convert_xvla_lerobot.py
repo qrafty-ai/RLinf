@@ -98,24 +98,21 @@ def _map_weight_name(old_name: str) -> Tuple[Optional[str], Optional[str]]:
 
     # Direct module remaps
     direct_map = {
-        "action_encoder.fc.weight": "policy_head.action_in_proj.weight",
-        "action_encoder.bias.weight": "policy_head.action_in_proj.bias",
-        "action_decoder.fc.weight": "policy_head.action_out_proj.weight",
-        "action_decoder.bias.weight": "policy_head.action_out_proj.bias",
-        "vlm_proj.weight": "policy_head.input_proj.weight",
-        "vlm_proj.bias": "policy_head.input_proj.bias",
+        "action_encoder.fc.weight": "policy_head.action_encoder.fc.weight",
+        "action_encoder.bias.weight": "policy_head.action_encoder.bias.weight",
+        "action_decoder.fc.weight": "policy_head.action_decoder.fc.weight",
+        "action_decoder.bias.weight": "policy_head.action_decoder.bias.weight",
+        "vlm_proj.weight": "policy_head.vlm_proj.weight",
+        "vlm_proj.bias": "policy_head.vlm_proj.bias",
+        "aux_visual_proj.weight": "policy_head.aux_visual_proj.weight",
+        "aux_visual_proj.bias": "policy_head.aux_visual_proj.bias",
+        "pos_emb": "policy_head.pos_emb",
         "norm.weight": "policy_head.norm.weight",
         "norm.bias": "policy_head.norm.bias",
-        "soft_prompt_hub.weight": "policy_head.soft_prompt_hub.soft_prompts",
+        "soft_prompt_hub.weight": "policy_head.soft_prompt_hub.weight",
     }
     if key in direct_map:
         return direct_map[key], None
-
-    # No target module in current RLinf implementation
-    if key.startswith("aux_visual_proj."):
-        return None, "aux_visual_proj_unused"
-    if key == "pos_emb":
-        return None, "pos_emb_unused"
 
     # Block-wise remap:
     # blocks.i.attn.(qkv|proj).{weight,bias} -> policy_head.blocks.i.attn...
@@ -164,6 +161,12 @@ def convert_weight_mapping(lerobot_weights: Dict[str, torch.Tensor]) -> Dict[str
             continue
         rlinf_weights[new_name] = tensor
 
+    # Florence2 shared embedding can be absent in source safetensors.
+    shared_key = "vlm.language_model.model.shared.weight"
+    encoder_embed_key = "vlm.language_model.model.encoder.embed_tokens.weight"
+    if shared_key not in rlinf_weights and encoder_embed_key in rlinf_weights:
+        rlinf_weights[shared_key] = rlinf_weights[encoder_embed_key].clone()
+
     if skipped:
         print("Skipped keys summary:")
         for reason, count in sorted(skipped.items()):
@@ -172,7 +175,7 @@ def convert_weight_mapping(lerobot_weights: Dict[str, torch.Tensor]) -> Dict[str
     return rlinf_weights
 
 
-def convert_config(lerobot_config: dict) -> dict:
+def convert_config(lerobot_config: dict, lerobot_weights: Optional[Dict[str, torch.Tensor]] = None) -> dict:
     """Convert LeRobot config to RLinf format.
     
     LeRobot config has nested structure that needs to be adapted.
@@ -185,6 +188,13 @@ def convert_config(lerobot_config: dict) -> dict:
 
     chunk_size = policy_cfg.get("chunk_size", 32)
     max_action_dim = policy_cfg.get("max_action_dim", 20)
+
+    detected_hetero_proj = False
+    if lerobot_weights is not None:
+        detected_hetero_proj = any(
+            k.endswith("transformer.vlm_proj.fc.weight") or k.endswith("transformer.aux_visual_proj.fc.weight")
+            for k in lerobot_weights.keys()
+        )
 
     # Extract relevant fields
     rlinf_config = {
@@ -212,7 +222,8 @@ def convert_config(lerobot_config: dict) -> dict:
             "num_domains": policy_cfg.get("num_domains", 30),
             "len_soft_prompts": policy_cfg.get("len_soft_prompts", 32),
             "dim_time": policy_cfg.get("dim_time", 32),
-            "use_hetero_proj": policy_cfg.get("use_hetero_proj", False),
+            "max_len_seq": policy_cfg.get("max_len_seq", 512),
+            "use_hetero_proj": detected_hetero_proj or policy_cfg.get("use_hetero_proj", False),
             
             # Flow-matching
             "noise_method": "flow_matching",
@@ -425,7 +436,7 @@ Examples:
     # 3. Convert config
     print("\nStep 3: Converting config...")
     try:
-        rlinf_config = convert_config(lerobot_config)
+        rlinf_config = convert_config(lerobot_config, lerobot_weights)
         print(f"  ✓ Converted config")
     except Exception as e:
         print(f"  ✗ Error converting config: {e}")
