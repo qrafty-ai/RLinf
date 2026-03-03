@@ -212,6 +212,37 @@ def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 100) -> torc
 # ------------------------------- Core Layers ----------------------------------
 
 
+class ValueHead(nn.Module):
+    """
+    Value head for PPO (predicts scalar value from features).
+
+    Simple MLP that takes pooled visual features and outputs a value estimate.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int) -> None:
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        x : Tensor
+            [batch_size, input_dim] pooled features
+
+        Returns
+        -------
+        Tensor
+            [batch_size, 1] value estimates
+        """
+        return self.network(x)
+
+
 class DomainAwareLinear(nn.Module):
     """
     Linear layer with domain-conditioned parameters (per-sample).

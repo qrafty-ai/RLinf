@@ -96,16 +96,23 @@ def _map_weight_name(old_name: str) -> Tuple[Optional[str], Optional[str]]:
 
     key = new_name[len("transformer.") :]
 
-    # Direct module remaps
+    # Direct module remaps (handles both nn.Linear and DomainAwareLinear)
     direct_map = {
+        # DomainAwareLinear case (use_hetero_proj=True)
         "action_encoder.fc.weight": "policy_head.action_encoder.fc.weight",
         "action_encoder.bias.weight": "policy_head.action_encoder.bias.weight",
         "action_decoder.fc.weight": "policy_head.action_decoder.fc.weight",
         "action_decoder.bias.weight": "policy_head.action_decoder.bias.weight",
+        "vlm_proj.fc.weight": "policy_head.vlm_proj.fc.weight",
+        "vlm_proj.bias.weight": "policy_head.vlm_proj.bias.weight",
+        "aux_visual_proj.fc.weight": "policy_head.aux_visual_proj.fc.weight",
+        "aux_visual_proj.bias.weight": "policy_head.aux_visual_proj.bias.weight",
+        # nn.Linear case (use_hetero_proj=False)
         "vlm_proj.weight": "policy_head.vlm_proj.weight",
         "vlm_proj.bias": "policy_head.vlm_proj.bias",
         "aux_visual_proj.weight": "policy_head.aux_visual_proj.weight",
         "aux_visual_proj.bias": "policy_head.aux_visual_proj.bias",
+        # Shared params
         "pos_emb": "policy_head.pos_emb",
         "norm.weight": "policy_head.norm.weight",
         "norm.bias": "policy_head.norm.bias",
@@ -117,7 +124,7 @@ def _map_weight_name(old_name: str) -> Tuple[Optional[str], Optional[str]]:
     # Block-wise remap:
     # blocks.i.attn.(qkv|proj).{weight,bias} -> policy_head.blocks.i.attn...
     # blocks.i.norm1|norm2.{weight,bias}      -> policy_head.blocks.i.norm...
-    # blocks.i.mlp.fc1|fc2.{weight,bias}      -> policy_head.blocks.i.mlp.0|2...
+    # blocks.i.mlp.fc1|fc2.{weight,bias}      -> policy_head.blocks.i.mlp.fc1|fc2...
     m = re.match(r"^blocks\.(\d+)\.(.+)$", key)
     if not m:
         return None, "unrecognized_transformer_key"
@@ -129,9 +136,9 @@ def _map_weight_name(old_name: str) -> Tuple[Optional[str], Optional[str]]:
         return f"policy_head.blocks.{block_idx}.{tail}", None
 
     if tail.startswith("mlp.fc1."):
-        return f"policy_head.blocks.{block_idx}.mlp.0.{tail[len('mlp.fc1.'):]}", None
+        return f"policy_head.blocks.{block_idx}.mlp.fc1.{tail[len('mlp.fc1.'):]}", None
     if tail.startswith("mlp.fc2."):
-        return f"policy_head.blocks.{block_idx}.mlp.2.{tail[len('mlp.fc2.'):]}", None
+        return f"policy_head.blocks.{block_idx}.mlp.fc2.{tail[len('mlp.fc2.'):]}", None
 
     return None, "unrecognized_block_tail"
 

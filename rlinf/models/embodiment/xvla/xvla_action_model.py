@@ -32,7 +32,7 @@ from rlinf.models.embodiment.xvla.soft_transformer import (
     SoftPromptedTransformer,
     ValueHead,
 )
-from rlinf.models.embodiment.xvla.action_space import ActionHub
+from rlinf.models.embodiment.xvla.action_space import build_action_space
 from rlinf.utils.logging import get_logger
 
 # Import custom Florence2 implementation (not from transformers to avoid dependency issues)
@@ -63,6 +63,8 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         self.config = config
         self.logger = get_logger()
         self.proprio_dim = proprio_dim
+        self.chunk_size = config.chunk_size
+        self.use_proprio = config.use_proprio
         
         # Build Florence2 config from nested structure
         florence_config = self._build_florence_config()
@@ -73,8 +75,22 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         # 2. Remove unused BART decoder to save memory
         self._remove_unused_decoder()
         
-        # 3. Initialize SoftPromptedTransformer policy head
         projection_dim = florence_config.projection_dim
+
+        # 3. Action space for preprocessing/postprocessing
+        if config.action_mode.lower() == "auto":
+            action_feature = getattr(config, "action_feature", None)
+            real_dim = action_feature.shape[-1] if action_feature is not None else config.max_action_dim
+            self.action_space = build_action_space(
+                config.action_mode.lower(),
+                real_dim=real_dim,
+                max_dim=config.max_action_dim,
+            )
+        else:
+            self.action_space = build_action_space(config.action_mode.lower())
+        self.dim_action = self.action_space.dim_action
+
+        # 4. Initialize SoftPromptedTransformer policy head
         self.policy_head = SoftPromptedTransformer(
             hidden_size=config.hidden_size,
             multi_modal_input_size=projection_dim,
@@ -84,14 +100,11 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
             num_domains=config.num_domains,
             len_soft_prompts=config.len_soft_prompts,
             dim_time=config.dim_time,
-            dim_action=config.max_action_dim,
-            dim_proprio=proprio_dim,
+            dim_action=self.dim_action,
+            dim_propio=proprio_dim,
             max_len_seq=config.max_len_seq,
             use_hetero_proj=config.use_hetero_proj,
         )
-        
-        # 4. Action space for preprocessing/postprocessing
-        self.action_space = ActionHub.build(config.action_mode)
         
         # 5. Optional value head for PPO
         if config.add_value_head:
@@ -104,8 +117,11 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         
         # 6. Apply freezing
         self._apply_freezing()
-        
-        # 7. Initialize BART tokenizer for language instructions
+
+        # 7. Apply dtype
+        self._apply_dtype()
+
+        # 8. Initialize BART tokenizer for language instructions
         self.tokenizer = BartTokenizerFast.from_pretrained(
             config.tokenizer_name,
             padding_side=config.tokenizer_padding_side,
@@ -115,7 +131,7 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         self.logger.info(f"Initialized XVLA model with config: {config.config_name}")
         self.logger.info(f"  Florence2 projection dim: {projection_dim}")
         self.logger.info(f"  Policy head hidden size: {config.hidden_size}")
-        self.logger.info(f"  Action dimension: {config.max_action_dim}")
+        self.logger.info(f"  Action dimension: {self.dim_action}")
         self.logger.info(f"  Proprio dimension: {proprio_dim}")
         self.logger.info(f"  Domain ID: {config.domain_id}")
         self.logger.info(f"  Tokenizer: {config.tokenizer_name} (max_length={config.tokenizer_max_length})")
@@ -137,32 +153,204 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         
         XVLA only uses the encoder for visual-language features.
         """
-        if hasattr(self.vlm, "model"):
-            model = self.vlm.model
-            if hasattr(model, "decoder"):
-                del model.decoder
+        if hasattr(self.vlm, "language_model"):
+            lm = self.vlm.language_model
+            if hasattr(lm, "model") and hasattr(lm.model, "decoder"):
+                del lm.model.decoder
                 self.logger.debug("Removed Florence2 decoder")
-        
-        # Remove lm_head if present
-        if hasattr(self.vlm, "lm_head"):
-            del self.vlm.lm_head
-            self.logger.debug("Removed Florence2 lm_head")
+            if hasattr(lm, "lm_head"):
+                del lm.lm_head
+                self.logger.debug("Removed Florence2 lm_head")
     
     def _apply_freezing(self):
         """Apply freezing based on config."""
-        # Freeze vision encoder
-        if self.config.freeze_vision_encoder:
-            if hasattr(self.vlm, "vision_tower"):
-                for param in self.vlm.vision_tower.parameters():
+        if self.config.freeze_vision_encoder and hasattr(self.vlm, "vision_tower"):
+            for param in self.vlm.vision_tower.parameters():
+                param.requires_grad = False
+
+        if self.config.freeze_language_encoder and hasattr(self.vlm, "language_model"):
+            lm = self.vlm.language_model
+            if hasattr(lm, "model") and hasattr(lm.model, "encoder"):
+                for param in lm.model.encoder.parameters():
                     param.requires_grad = False
-                self.logger.debug("Frozen vision encoder")
-        
-        # Freeze language encoder
-        if self.config.freeze_language_encoder:
-            if hasattr(self.vlm, "model") and hasattr(self.vlm.model, "encoder"):
-                for param in self.vlm.model.encoder.parameters():
+            if hasattr(lm, "model") and hasattr(lm.model, "shared"):
+                for param in lm.model.shared.parameters():
                     param.requires_grad = False
-                self.logger.debug("Frozen language encoder")
+
+        if not self.config.train_policy_transformer:
+            for name, param in self.policy_head.named_parameters():
+                if "soft_prompt" not in name:
+                    param.requires_grad = False
+
+        if not self.config.train_soft_prompts and hasattr(self.policy_head, "soft_prompt_hub"):
+            for param in self.policy_head.soft_prompt_hub.parameters():
+                param.requires_grad = False
+
+    def _get_target_dtype(self) -> torch.dtype:
+        """Get target dtype from config."""
+        if self.config.dtype == "bfloat16":
+            return torch.bfloat16
+        return torch.float32
+
+    def _apply_dtype(self) -> None:
+        """Apply dtype casting to model components."""
+        self.to(dtype=self._get_target_dtype())
+
+    def _get_default_image_mask(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Create default all-valid image mask with shape [B, V]."""
+        if pixel_values.dim() == 4:
+            pixel_values = pixel_values.unsqueeze(1)
+        return torch.ones(
+            pixel_values.shape[0],
+            pixel_values.shape[1],
+            dtype=torch.bool,
+            device=pixel_values.device,
+        )
+
+    def _prepare_image_mask(self, image_mask: Optional[torch.Tensor], pixel_values: torch.Tensor) -> torch.Tensor:
+        """Normalize image mask to bool [B, V]."""
+        if image_mask is None:
+            return self._get_default_image_mask(pixel_values)
+
+        if image_mask.dim() > 2:
+            reduce_dims = tuple(range(2, image_mask.dim()))
+            image_mask = image_mask.any(dim=reduce_dims)
+
+        if image_mask.dim() == 1:
+            image_mask = image_mask.unsqueeze(1)
+
+        if image_mask.shape[0] != pixel_values.shape[0]:
+            image_mask = image_mask.expand(pixel_values.shape[0], -1)
+
+        if image_mask.shape[1] < pixel_values.shape[1]:
+            pad = torch.zeros(
+                pixel_values.shape[0],
+                pixel_values.shape[1] - image_mask.shape[1],
+                dtype=image_mask.dtype,
+                device=image_mask.device,
+            )
+            image_mask = torch.cat([image_mask, pad], dim=1)
+        elif image_mask.shape[1] > pixel_values.shape[1]:
+            image_mask = image_mask[:, : pixel_values.shape[1]]
+
+        return image_mask.to(device=pixel_values.device, dtype=torch.bool)
+
+    def _prepare_proprio(
+        self,
+        proprio: Optional[torch.Tensor],
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Normalize proprio to [B, proprio_dim] tensor."""
+        if proprio is None:
+            return torch.zeros(batch_size, self.proprio_dim, device=device, dtype=dtype)
+
+        if isinstance(proprio, np.ndarray):
+            proprio = torch.from_numpy(proprio)
+
+        proprio = proprio.to(device=device, dtype=dtype)
+        if proprio.dim() == 1:
+            proprio = proprio.unsqueeze(0)
+
+        if proprio.shape[0] != batch_size:
+            proprio = proprio.expand(batch_size, -1)
+
+        if proprio.shape[-1] < self.proprio_dim:
+            pad = torch.zeros(batch_size, self.proprio_dim - proprio.shape[-1], device=device, dtype=dtype)
+            proprio = torch.cat([proprio, pad], dim=-1)
+        elif proprio.shape[-1] > self.proprio_dim:
+            proprio = proprio[..., : self.proprio_dim]
+
+        return proprio
+
+    def _prepare_domain_id(self, domain_id: Optional[torch.Tensor], batch_size: int, device: torch.device) -> torch.Tensor:
+        """Normalize domain ids to [B] long tensor."""
+        if domain_id is None:
+            return torch.full((batch_size,), self.config.domain_id, dtype=torch.long, device=device)
+
+        if not isinstance(domain_id, torch.Tensor):
+            domain_id = torch.as_tensor(domain_id, device=device)
+        else:
+            domain_id = domain_id.to(device=device)
+
+        if domain_id.ndim == 0:
+            domain_id = domain_id.expand(batch_size)
+        if domain_id.ndim > 1:
+            domain_id = domain_id.reshape(domain_id.shape[0], -1)[:, 0]
+        if domain_id.shape[0] != batch_size:
+            domain_id = domain_id.expand(batch_size)
+
+        return domain_id.to(dtype=torch.long)
+
+    def _extract_env_state_dim(self, env_obs: dict[str, Any]) -> Optional[int]:
+        """Best-effort extraction of state dimension from raw env observations."""
+        state = env_obs.get("states")
+        if state is None:
+            return None
+
+        if isinstance(state, np.ndarray):
+            if state.ndim == 0:
+                return None
+            return int(state.shape[-1])
+        if isinstance(state, torch.Tensor):
+            if state.ndim == 0:
+                return None
+            return int(state.shape[-1])
+
+        try:
+            state_tensor = torch.as_tensor(state)
+            if state_tensor.ndim == 0:
+                return None
+            return int(state_tensor.shape[-1])
+        except Exception:
+            return None
+
+    def _infer_target_action_dim(self, env_obs: dict[str, Any], action: torch.Tensor) -> int:
+        """Infer output action dimension from generic env metadata/state shape."""
+        for key in ("action_dim", "expected_action_dim", "control_dim"):
+            if key in env_obs and env_obs[key] is not None:
+                value = env_obs[key]
+                if isinstance(value, torch.Tensor):
+                    if value.numel() > 0:
+                        return int(value.reshape(-1)[0].item())
+                elif isinstance(value, np.ndarray):
+                    if value.size > 0:
+                        return int(value.reshape(-1)[0])
+                else:
+                    return int(value)
+
+        state_dim = self._extract_env_state_dim(env_obs)
+        if state_dim is None:
+            return int(action.shape[-1])
+
+        if state_dim == 8 and action.shape[-1] >= 10:
+            return 7
+        if 0 < state_dim <= action.shape[-1]:
+            return state_dim
+        return int(action.shape[-1])
+
+    def _convert_action_to_target_dim(self, action: torch.Tensor, target_dim: int) -> torch.Tensor:
+        """Convert/pad/trim action to target dimension without env-specific branching."""
+        if target_dim <= 0:
+            return action
+        if action.shape[-1] == target_dim:
+            return action
+
+        if target_dim == 7 and action.shape[-1] >= 10:
+            from rlinf.models.embodiment.xvla.rotation_utils import rotation_6d_to_axis_angle
+
+            pos = action[..., :3]
+            rot6d = action[..., 3:9]
+            axis_angle = rotation_6d_to_axis_angle(rot6d)
+            gripper = action[..., 9:10]
+            return torch.cat([pos, axis_angle, gripper], dim=-1)
+
+        if target_dim < action.shape[-1]:
+            return action[..., :target_dim]
+
+        pad_shape = (*action.shape[:-1], target_dim - action.shape[-1])
+        return torch.cat([action, action.new_zeros(pad_shape)], dim=-1)
     
     @property
     def _no_split_modules(self) -> list[str]:
@@ -199,60 +387,13 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         self,
         pixel_values: torch.Tensor,
         input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
+        image_mask: Optional[torch.Tensor],
     ) -> dict[str, torch.Tensor]:
-        """Get visual-language features from Florence2.
-        
-        Args:
-            pixel_values: Image pixels [batch, num_images, C, H, W]
-            input_ids: Language token IDs [batch, seq_len]
-            attention_mask: Attention mask [batch, seq_len]
-            
-        Returns:
-            Dictionary with:
-                - vlm_features: [batch, seq_len, projection_dim]
-                - aux_visual_inputs: [batch, seq_aux, projection_dim]
-        """
-        if not hasattr(self, "_debug_vlm_shapes_logged"):
-            self._debug_vlm_shapes_logged = True
-            self.logger.info(f"_get_vlm_features pixel_values shape: {tuple(pixel_values.shape)}")
-            self.logger.info(f"_get_vlm_features input_ids shape: {tuple(input_ids.shape)}")
-
+        """Get visual-language features from Florence2."""
         if pixel_values.dim() == 4:
             pixel_values = pixel_values.unsqueeze(1)
-
-        batch_size, num_views = pixel_values.shape[:2]
-        flat_images = pixel_values.reshape(batch_size * num_views, *pixel_values.shape[2:])
-
-        # Encode all views then restore [B, V, T, C]
-        image_features = self.vlm._encode_image(flat_images)
-        image_tokens = image_features.shape[1]
-        feature_dim = image_features.shape[2]
-        image_features = image_features.reshape(batch_size, num_views, image_tokens, feature_dim)
-
-        # Get text token embeddings
-        text_embeds = self.vlm.get_input_embeddings()(input_ids)
-
-        # Merge image and text tokens and attention masks
-        combined_embeds, combined_attention_mask = self.vlm._merge_input_ids_with_image_features(
-            image_features[:, 0],
-            text_embeds,
-        )
-        if attention_mask is not None:
-            combined_attention_mask[:, image_tokens:] = attention_mask
-
-        # Run encoder-only path
-        encoder_outputs = self.vlm.language_model.model.encoder(
-            inputs_embeds=combined_embeds,
-            attention_mask=combined_attention_mask,
-        )
-
-        aux_visual_inputs = image_features[:, 1:].reshape(batch_size, -1, feature_dim)
-
-        return {
-            "vlm_features": encoder_outputs.last_hidden_state,
-            "aux_visual_inputs": aux_visual_inputs,
-        }
+        image_mask = self._prepare_image_mask(image_mask, pixel_values)
+        return self.forward_vlm(input_ids=input_ids, pixel_values=pixel_values, image_mask=image_mask)
     
     def forward(
         self,
@@ -285,59 +426,51 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
             Dictionary with loss and metrics
         """
         observations = data["observations"]
-        actions = data["actions"]  # [batch, action_chunk, action_dim]
-        
-        # Get VLM features
-        pixel_values = observations["pixel_values"]
-        input_ids = observations["input_ids"]
-        attention_mask = observations["attention_mask"]
-        
-        feature_dict = self._get_vlm_features(pixel_values, input_ids, attention_mask)
-        vlm_features = feature_dict["vlm_features"]
-        aux_visual_inputs = feature_dict["aux_visual_inputs"]
-        
-        if actions.shape[-1] != self.config.max_action_dim:
-            actions = self.action_space.preprocess(actions).to(actions.device)
+        actions = data["actions"]
 
-        # Compute flow-matching loss
+        target_dtype = self._get_target_dtype()
+        pixel_values = observations["pixel_values"].to(dtype=target_dtype)
+        input_ids = observations["input_ids"]
+        image_mask = observations.get("image_mask")
+
+        if pixel_values.dim() == 4:
+            pixel_values = pixel_values.unsqueeze(1)
+
         batch_size = actions.shape[0]
-        
-        # Sample time
-        t = torch.rand(batch_size, device=actions.device)
-        
-        # Sample noise
-        z0 = torch.randn_like(actions)
-        
-        # Interpolate
-        t_expanded = t.view(-1, 1, 1)
-        z_t = (1 - t_expanded) * z0 + t_expanded * actions
-        
-        # Ground truth vector field
-        u_t = actions - z0
-        
-        # Predict vector field
-        proprio = observations.get("proprio", None)
-        domain_ids = observations.get("domain_id", None)
-        if domain_ids is None:
-            domain_ids = torch.full(
-                (batch_size,), self.config.domain_id, dtype=torch.long, device=actions.device
-            )
-        v_t = self.policy_head(
-            z_t=z_t,
-            t=t,
-            multi_modal_features=vlm_features,
-            aux_visual_inputs=aux_visual_inputs,
-            proprio=proprio,
-            domain_ids=domain_ids,
+        image_mask = self._prepare_image_mask(image_mask, pixel_values)
+        proprio = self._prepare_proprio(
+            observations.get("proprio"),
+            batch_size=batch_size,
+            device=actions.device,
+            dtype=target_dtype,
         )
-        
-        # MSE loss
-        loss = F.mse_loss(v_t, u_t)
-        
-        return {
-            "loss": loss,
-            "metrics": {"sft_loss": loss.item()},
-        }
+        domain_id = self._prepare_domain_id(observations.get("domain_id"), batch_size, actions.device)
+
+        action_target = actions.to(dtype=target_dtype)
+        enc = self._get_vlm_features(pixel_values, input_ids, image_mask)
+
+        t = (
+            torch.rand(1, device=actions.device, dtype=target_dtype)
+            + torch.arange(batch_size, device=actions.device, dtype=target_dtype) / batch_size
+        ) % (1 - 1e-5)
+
+        action_noisy = torch.randn_like(action_target) * t.view(-1, 1, 1) + action_target * (1 - t).view(-1, 1, 1)
+        proprio_m, action_noisy_m = self.action_space.preprocess(proprio, action_noisy)
+
+        pred_action = self.policy_head(
+            domain_id=domain_id,
+            action_with_noise=action_noisy_m,
+            proprio=proprio_m,
+            t=t,
+            **enc,
+        )
+
+        loss_dict = self.action_space.compute_loss(pred_action, action_target)
+        total_loss = sum(loss_dict.values())
+
+        metrics = {name: value.detach().item() for name, value in loss_dict.items()}
+        metrics["sft_loss"] = total_loss.detach().item()
+        return {"loss": total_loss, "metrics": metrics}
     
     def default_forward(
         self,
@@ -355,60 +488,57 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         Returns:
             Dictionary with logprobs, values, entropy
         """
-        chains = forward_inputs["chains"]  # [batch, num_steps, action_chunk, action_dim]
-        timesteps = forward_inputs["timesteps"]  # [batch, num_steps]
+        chains = forward_inputs["chains"]
+        timesteps = forward_inputs["timesteps"]
         observations = forward_inputs["observations"]
-        
+
+        target_dtype = self._get_target_dtype()
         batch_size = chains.shape[0]
         num_steps = chains.shape[1]
-        
-        # Get VLM features (shared across all timesteps)
-        pixel_values = observations["pixel_values"]
+
+        pixel_values = observations["pixel_values"].to(dtype=target_dtype)
         input_ids = observations["input_ids"]
-        attention_mask = observations["attention_mask"]
-        proprio = observations.get("proprio", None)
-        
-        feature_dict = self._get_vlm_features(pixel_values, input_ids, attention_mask)
+        image_mask = self._prepare_image_mask(observations.get("image_mask"), pixel_values)
+        proprio = self._prepare_proprio(
+            observations.get("proprio"),
+            batch_size=batch_size,
+            device=chains.device,
+            dtype=target_dtype,
+        )
+        domain_id = self._prepare_domain_id(observations.get("domain_id"), batch_size, chains.device)
+
+        feature_dict = self._get_vlm_features(pixel_values, input_ids, image_mask)
         vlm_features = feature_dict["vlm_features"]
         aux_visual_inputs = feature_dict["aux_visual_inputs"]
-        domain_ids = observations.get("domain_id", None)
-        if domain_ids is None:
-            domain_ids = torch.full(
-                (batch_size,), self.config.domain_id, dtype=torch.long, device=chains.device
-            )
-        
-        # Compute log-probs by evaluating the flow at each timestep
+
         logprobs_list = []
         for i in range(num_steps):
-            z_t = chains[:, i]  # [batch, action_chunk, action_dim]
-            t = timesteps[:, i]  # [batch]
-            
-            # Predict vector field
-            v_t = self.policy_head(
-                z_t=z_t,
+            action_noisy = chains[:, i].to(dtype=target_dtype)
+            t = timesteps[:, i].to(dtype=target_dtype)
+
+            proprio_m, action_noisy_m = self.action_space.preprocess(proprio, action_noisy)
+            pred_action = self.policy_head(
+                domain_id=domain_id,
+                action_with_noise=action_noisy_m,
+                proprio=proprio_m,
                 t=t,
-                multi_modal_features=vlm_features,
+                vlm_features=vlm_features,
                 aux_visual_inputs=aux_visual_inputs,
-                proprio=proprio,
-                domain_ids=domain_ids,
             )
-            
-            # Log-prob is related to the vector field magnitude
-            # For simplicity, use negative squared error
-            logprob = -0.5 * (v_t ** 2).sum(dim=-1)  # [batch, action_chunk]
+
+            residual = pred_action - action_noisy_m
+            logprob = -0.5 * (residual**2).sum(dim=-1)
             logprobs_list.append(logprob)
-        
-        logprobs = torch.stack(logprobs_list, dim=1)  # [batch, num_steps, action_chunk]
-        
-        # Compute values if value head exists
+
+        logprobs = torch.stack(logprobs_list, dim=1)
+
         values = None
         if self.value_head is not None:
             pooled_features = vlm_features.mean(dim=1)
-            values = self.value_head(pooled_features).squeeze(-1)  # [batch]
-        
-        # Compute entropy (simplified)
+            values = self.value_head(pooled_features).squeeze(-1)
+
         entropy = torch.zeros(batch_size, device=chains.device)
-        
+
         return {
             "logprobs": logprobs,
             "values": values,
@@ -419,13 +549,50 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         """Soft Actor-Critic forward pass (placeholder)."""
         raise NotImplementedError("SAC forward not implemented for XVLA")
     
+    def forward_vlm(
+        self,
+        input_ids: torch.LongTensor,
+        pixel_values: torch.FloatTensor,
+        image_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Encode text and multi-view images via Florence2 encoder.
+        """
+        batch_size, num_views = pixel_values.shape[:2]
+        flat_mask = image_mask.view(-1).to(dtype=torch.bool)
+        flat_images = pixel_values.flatten(0, 1)
+        num_valid = int(flat_mask.sum().item())
+        if num_valid == 0:
+            raise ValueError("At least one image view must be valid per batch.")
+
+        valid_images = flat_images[flat_mask]
+        valid_feats = self.vlm._encode_image(valid_images)
+        tokens_per_view, hidden_dim = valid_feats.shape[1:]
+
+        image_features = valid_feats.new_zeros((batch_size * num_views, tokens_per_view, hidden_dim))
+        image_features[flat_mask] = valid_feats
+        image_features = image_features.view(batch_size, num_views, tokens_per_view, hidden_dim)
+        inputs_embeds = self.vlm.get_input_embeddings()(input_ids)
+        merged_embeds, attention_mask = self.vlm._merge_input_ids_with_image_features(
+            image_features[:, 0],
+            inputs_embeds,
+        )
+
+        enc_out = self.vlm.language_model.model.encoder(
+            attention_mask=attention_mask,
+            inputs_embeds=merged_embeds,
+        )[0]
+
+        aux_visual_inputs = image_features[:, 1:].reshape(batch_size, -1, hidden_dim)
+        return {"vlm_features": enc_out, "aux_visual_inputs": aux_visual_inputs}
+
     def predict_action_batch(
         self,
         env_obs: dict[str, Any],
         mode: Literal["train", "eval"] = "eval",
         sampling_params: Optional[dict] = None,
         **kwargs
-    ) -> dict[str, torch.Tensor]:
+    ) -> tuple[torch.Tensor, None]:
         """Generate actions for rollout (inference).
         
         Args:
@@ -434,63 +601,66 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
             sampling_params: Unused for XVLA (kept for API compatibility)
             
         Returns:
-            Dictionary with actions
+            Tuple of (actions, None)
         """
-        # Process observations through input_transform (merged obs_processor + transform)
         transformed_obs = self.input_transform(env_obs)
-        
-        # Extract transformed inputs
+
         pixel_values = transformed_obs["pixel_values"]
         input_ids = transformed_obs["input_ids"]
-        attention_mask = transformed_obs["attention_mask"]
-        proprio = transformed_obs.get("proprio", None)
-        
-        domain_ids = transformed_obs.get("domain_id", None)
-        if domain_ids is None:
-            domain_ids = torch.full(
-                (pixel_values.shape[0],), self.config.domain_id, dtype=torch.long, device=pixel_values.device
-            )
+        image_mask = self._prepare_image_mask(transformed_obs.get("image_mask"), pixel_values)
+
+        batch_size = pixel_values.shape[0]
+        target_dtype = self._get_target_dtype()
+        device = pixel_values.device
+
+        proprio = self._prepare_proprio(
+            transformed_obs.get("proprio"),
+            batch_size=batch_size,
+            device=device,
+            dtype=target_dtype,
+        )
+        domain_id = self._prepare_domain_id(transformed_obs.get("domain_id"), batch_size, device)
+        pixel_values = pixel_values.to(dtype=target_dtype)
 
         with torch.no_grad():
-            feature_dict = self._get_vlm_features(pixel_values, input_ids, attention_mask)
-            vlm_features = feature_dict["vlm_features"]
-            aux_visual_inputs = feature_dict["aux_visual_inputs"]
-        
-        # LeRobot-compatible iterative denoising
-        batch_size = pixel_values.shape[0]
-        device = pixel_values.device
+            enc = self.forward_vlm(input_ids, pixel_values, image_mask)
+
         actions = torch.zeros(
             batch_size,
-            self.config.chunk_size,
-            self.config.max_action_dim,
+            self.chunk_size,
+            self.dim_action,
             device=device,
-            dtype=vlm_features.dtype,
+            dtype=target_dtype,
         )
         x1 = torch.randn_like(actions)
 
-        for i in range(self.config.num_steps, 0, -1):
+        steps = self.config.num_steps
+        if sampling_params is not None and "num_steps" in sampling_params:
+            steps = int(sampling_params["num_steps"])
+        steps = max(1, steps)
+
+        for i in range(steps, 0, -1):
             t = torch.full(
                 (batch_size,),
-                float(i) / float(self.config.num_steps),
+                float(i) / float(steps),
                 device=device,
                 dtype=actions.dtype,
             )
             t_expanded = t.view(-1, 1, 1)
             x_t = x1 * t_expanded + actions * (1.0 - t_expanded)
+            proprio_m, x_t_m = self.action_space.preprocess(proprio, x_t)
             actions = self.policy_head(
-                z_t=x_t,
+                domain_id=domain_id,
+                action_with_noise=x_t_m,
+                proprio=proprio_m,
                 t=t,
-                multi_modal_features=vlm_features,
-                aux_visual_inputs=aux_visual_inputs,
-                proprio=proprio,
-                domain_ids=domain_ids,
+                **enc
             )
-        
-        # Postprocess
-        actions_np = self.action_space.postprocess(actions)
-        
-        actions_tensor = torch.from_numpy(actions_np).to(device)
-        return actions_tensor, None
+
+        actions = self.action_space.postprocess(actions)
+        target_dim = self._infer_target_action_dim(env_obs=env_obs, action=actions)
+        actions = self._convert_action_to_target_dim(actions, target_dim)
+        return actions.to(dtype=torch.float32), None
     
     def sample_actions(
         self,
@@ -533,12 +703,18 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         Returns:
             Tuple of (log_probs, values, entropy)
         """
-        # Build observations dict
+        stacked_images = torch.stack(images, dim=1)
+        if len(img_masks) > 0:
+            stacked_mask = torch.stack(img_masks, dim=1)
+        else:
+            stacked_mask = self._get_default_image_mask(stacked_images)
+
         observations = {
-            "pixel_values": torch.stack(images, dim=1),  # [batch, num_images, C, H, W]
+            "pixel_values": stacked_images,
+            "image_mask": stacked_mask,
             "input_ids": lang_tokens,
             "attention_mask": lang_masks,
-            "proprio": state if self.proprio_dim > 0 else None,
+            "proprio": state,
             "domain_id": torch.full(
                 (lang_tokens.shape[0],),
                 self.config.domain_id,
@@ -582,11 +758,8 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
     ) -> dict[str, Any]:
         """Transform environment observations to model format.
         
-        Combines obs_processor and input_transform into single method.
-        Handles conversion from environment-specific state formats to LeRobot format.
-        Currently supports:
-          - LIBERO: 8D [pos(3), axis_angle(3), gripper(2)] → 20D LeRobot format
-          - LeRobot: 20D [pos(3), rot6d(6), gripper(1), zeros(10)] (passthrough)
+        Combines obs_processor and input_transform into a single method.
+        Handles generic conversion to model-ready tensors.
         
         Args:
             env_obs: Environment observation dictionary with images, states, task_descriptions
@@ -595,53 +768,70 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         Returns:
             Dictionary with pixel_values, input_ids, attention_mask, proprio, domain_id
         """
+        del transpose
+
         device = next(self.parameters()).device
+        target_dtype = self._get_target_dtype()
 
-        self.logger.info(f"env_obs keys: {list(env_obs.keys())}")
-        
-        # === Step 1: Extract and process images ===
-        image_keys = [key for key in env_obs.keys() if "image" in key]
-        images: list = []
+        image_keys = [key for key in env_obs.keys() if "image" in key and env_obs[key] is not None]
+        if len(image_keys) == 0:
+            raise ValueError("No image observations found in env_obs.")
+
+        images: list[torch.Tensor] = []
         for key in image_keys:
-            self.logger.info(f"Image key: {key}, type: {type(env_obs[key])}, shape: {getattr(env_obs[key], 'shape', 'N/A')}")
-            if env_obs[key] is not None:
-               images.append(env_obs[key])
+            image = env_obs[key]
+            if isinstance(image, np.ndarray):
+                image = torch.from_numpy(image)
+            elif not isinstance(image, torch.Tensor):
+                image = torch.as_tensor(image)
 
-        # Infer batch size from images
-        if isinstance(images[0], torch.Tensor) or isinstance(images[0], np.ndarray):
-            batch_size = images[0].shape[0]
-        else:
-            batch_size = 1
+            if image.dim() == 3:
+                image = image.unsqueeze(0)
 
-        # Stack images and normalize tensor layout to [batch, num_views, 3, H, W]
+            if image.dim() != 4:
+                raise ValueError(f"Expected image tensor with rank 4, got shape {tuple(image.shape)} for key '{key}'.")
+
+            if image.shape[-1] == 3:
+                image = image.permute(0, 3, 1, 2)
+
+            if image.shape[1] != 3:
+                raise ValueError(f"Expected 3 channels, got shape {tuple(image.shape)} for key '{key}'.")
+
+            images.append(image.float())
+
+        batch_size = images[0].shape[0]
         pixel_values = torch.stack(images, dim=1)
+        image_mask = torch.ones(batch_size, pixel_values.shape[1], dtype=torch.bool, device=pixel_values.device)
 
-        # Handle channel-last inputs, e.g. [B, V, H, W, 3] -> [B, V, 3, H, W]
-        if pixel_values.dim() == 5 and pixel_values.shape[-1] == 3:
-            pixel_values = pixel_values.permute(0, 1, 4, 2, 3)
+        total_views = self.config.num_images_in_input or pixel_values.shape[1]
+        total_views = max(total_views, pixel_values.shape[1])
+        if total_views > pixel_values.shape[1]:
+            pad_views = total_views - pixel_values.shape[1]
+            pad_images = pixel_values.new_zeros((batch_size, pad_views, *pixel_values.shape[2:]))
+            pad_mask = image_mask.new_zeros((batch_size, pad_views))
+            pixel_values = torch.cat([pixel_values, pad_images], dim=1)
+            image_mask = torch.cat([image_mask, pad_mask], dim=1)
 
-        # Handle single-view channel-last [B, H, W, 3] -> [B, 1, 3, H, W]
-        if pixel_values.dim() == 4 and pixel_values.shape[-1] == 3:
-            pixel_values = pixel_values.permute(0, 3, 1, 2).unsqueeze(1)
-
-        # Resize to 224x224 if needed
-        if pixel_values.shape[-1] != 224:
+        if tuple(pixel_values.shape[-2:]) != (224, 224):
             pixel_values = F.interpolate(
                 pixel_values.flatten(0, 1),
                 size=(224, 224),
                 mode="bilinear",
                 align_corners=False,
-            ).unflatten(0, (batch_size, -1))
+            ).unflatten(0, (batch_size, pixel_values.shape[1]))
 
-        # Ensure image tensor is on the same device as model weights
-        assert pixel_values.shape == (batch_size, len(images), 3, 224, 224), f"Unexpected pixel_values shape: {pixel_values.shape}"
-        pixel_values = pixel_values.to(device)
-        
-        # === Step 2: Extract and tokenize language ===
-        task_desc = env_obs["task_descriptions"]
+        pixel_values = pixel_values.to(device=device, dtype=target_dtype)
+        image_mask = image_mask.to(device=device, dtype=torch.bool)
+
+        task_desc = env_obs.get("task_descriptions", "")
         if isinstance(task_desc, str):
             task_desc = [task_desc] * batch_size
-        
+        elif isinstance(task_desc, list):
+            if len(task_desc) == 1 and batch_size > 1:
+                task_desc = task_desc * batch_size
+        else:
+            task_desc = [str(task_desc)] * batch_size
+
         tokenized = self.tokenizer(
             task_desc,
             padding="max_length",
@@ -651,84 +841,24 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         )
         input_ids = tokenized.input_ids.to(device)
         attention_mask = tokenized.attention_mask.to(device)
-        
-        # === Step 3: Extract and process proprioception ===
-        state = env_obs["states"]
-        
-        if state is not None and self.proprio_dim > 0:
-            if isinstance(state, np.ndarray):
-                state = torch.from_numpy(state).float().to(device)
-            elif isinstance(state, torch.Tensor):
-                state = state.to(device)
-            
-            # Detect state format and convert if needed
-            state_dim = state.shape[-1]
-            
-            if state_dim == 8:
-                # LIBERO format: [pos(3), axis_angle(3), gripper(2)]
-                proprio = self._convert_libero_state_to_lerobot(state)
-            elif state_dim == 20:
-                # Already LeRobot format
-                proprio = state
-            else:
-                # Unknown format - pad as needed
-                self.logger.warning(f"Unknown state dimension {state_dim}, using as-is")
-                if state_dim < self.proprio_dim:
-                    padding = torch.zeros(batch_size, self.proprio_dim - state_dim, device=device)
-                    proprio = torch.cat([state, padding], dim=-1)
-                else:
-                    proprio = state[:, :self.proprio_dim]
-            
-            # Ensure correct shape
-            if proprio.dim() == 1:
-                proprio = proprio.unsqueeze(0)
-            if proprio.shape[-1] < self.proprio_dim:
-                padding = torch.zeros(batch_size, self.proprio_dim - proprio.shape[-1], device=device)
-                proprio = torch.cat([proprio, padding], dim=-1)
-        else:
-            proprio = None
-        
-        # === Step 4: Add domain ID ===
-        domain_id = torch.full((batch_size,), self.config.domain_id, dtype=torch.long, device=device)
-        
+
+        state = env_obs.get("states")
+        proprio = self._prepare_proprio(
+            state,
+            batch_size=batch_size,
+            device=device,
+            dtype=target_dtype,
+        )
+        domain_id = self._prepare_domain_id(env_obs.get("domain_id"), batch_size, device)
+
         return {
             "pixel_values": pixel_values,
+            "image_mask": image_mask,
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "proprio": proprio,
             "domain_id": domain_id,
         }
-    
-    def _convert_libero_state_to_lerobot(self, libero_state: torch.Tensor) -> torch.Tensor:
-        """Convert LIBERO 8D state to LeRobot 20D format.
-        
-        Args:
-            libero_state: [batch, 8] = [pos(3), axis_angle(3), gripper(2)]
-            
-        Returns:
-            lerobot_state: [batch, 20] = [pos(3), rot6d(6), gripper(1), zeros(10)]
-        """
-        from rlinf.models.embodiment.xvla.rotation_utils import axis_angle_to_rotation_6d
-        
-        # Extract components
-        pos = libero_state[..., :3]  # [batch, 3]
-        axis_angle = libero_state[..., 3:6]  # [batch, 3]
-        gripper = libero_state[..., 6:8]  # [batch, 2]
-        
-        # Convert axis-angle to 6D rotation
-        rot6d = axis_angle_to_rotation_6d(axis_angle)  # [batch, 6]
-        
-        # Use first gripper finger (or mean)
-        gripper_1d = gripper[..., :1]  # [batch, 1]
-        
-        # Build 10D LeRobot state
-        state_10d = torch.cat([pos, rot6d, gripper_1d], dim=-1)  # [batch, 10]
-        
-        # Zero-pad to 20D
-        padding = torch.zeros(*state_10d.shape[:-1], 10, device=state_10d.device)
-        state_20d = torch.cat([state_10d, padding], dim=-1)  # [batch, 20]
-        
-        return state_20d
     
     def output_transform(self, outputs: dict[str, Any]) -> dict[str, Any]:
         """Transform model outputs to environment format."""
@@ -768,12 +898,17 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         model_state_dict = self.state_dict()
 
         alias_map = {
+            # Legacy/LeRobot naming → RLinf DomainAwareLinear naming
             "policy_head.action_in_proj.weight": "policy_head.action_encoder.fc.weight",
             "policy_head.action_in_proj.bias": "policy_head.action_encoder.bias.weight",
             "policy_head.action_out_proj.weight": "policy_head.action_decoder.fc.weight",
             "policy_head.action_out_proj.bias": "policy_head.action_decoder.bias.weight",
+            # For non-hetero (nn.Linear) case
             "policy_head.input_proj.weight": "policy_head.vlm_proj.weight",
             "policy_head.input_proj.bias": "policy_head.vlm_proj.bias",
+            # For hetero (DomainAwareLinear) case
+            "policy_head.input_proj.fc.weight": "policy_head.vlm_proj.fc.weight",
+            "policy_head.input_proj.bias.weight": "policy_head.vlm_proj.bias.weight",
             "policy_head.soft_prompt_hub.soft_prompts": "policy_head.soft_prompt_hub.weight",
         }
 
@@ -786,15 +921,24 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
 
             mapped = alias_map.get(mapped, mapped)
 
+            if ".mlp.0." in mapped:
+                mapped = mapped.replace(".mlp.0.", ".mlp.fc1.")
+            if ".mlp.2." in mapped:
+                mapped = mapped.replace(".mlp.2.", ".mlp.fc2.")
             if ".mlp.3." in mapped:
-                mapped = mapped.replace(".mlp.3.", ".mlp.2.")
+                mapped = mapped.replace(".mlp.3.", ".mlp.fc2.")
 
-            if mapped.startswith("policy_head.action_encoder.bias") and mapped != "policy_head.action_encoder.bias.weight":
+            # Handle DomainAwareLinear bias (Embedding layer stores as .bias.weight)
+            if mapped.startswith("policy_head.action_encoder.bias") and not mapped.endswith(".weight"):
                 mapped = mapped.replace("policy_head.action_encoder.bias", "policy_head.action_encoder.bias.weight")
-            if mapped.startswith("policy_head.action_decoder.bias") and mapped != "policy_head.action_decoder.bias.weight":
+            if mapped.startswith("policy_head.action_decoder.bias") and not mapped.endswith(".weight"):
                 mapped = mapped.replace("policy_head.action_decoder.bias", "policy_head.action_decoder.bias.weight")
-            if mapped.startswith("policy_head.vlm_proj.bias") and mapped.endswith(".weight"):
-                mapped = mapped.replace("policy_head.vlm_proj.bias.weight", "policy_head.vlm_proj.bias")
+            # Handle nn.Linear bias for non-hetero vlm_proj
+            if mapped.startswith("policy_head.vlm_proj.bias") and not mapped.endswith(".weight") and "fc" not in mapped:
+                mapped = mapped.replace("policy_head.vlm_proj.bias", "policy_head.vlm_proj.bias")
+            # Handle DomainAwareLinear bias for hetero vlm_proj
+            if mapped.startswith("policy_head.vlm_proj.bias") and not mapped.endswith(".weight") and "fc" in mapped:
+                mapped = mapped.replace("policy_head.vlm_proj.bias.weight", "policy_head.vlm_proj.bias.weight")
 
             if mapped == "policy_head.soft_prompt_hub.soft_prompts":
                 mapped = "policy_head.soft_prompt_hub.weight"
