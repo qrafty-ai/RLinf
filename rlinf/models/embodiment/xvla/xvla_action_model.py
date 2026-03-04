@@ -444,12 +444,14 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         **kwargs
     ) -> dict[str, Any]:
         """Supervised fine-tuning forward pass.
-        
+
         Args:
             data: Dictionary containing:
-                - observations: Processed observations
+                - observations: Processed observations with either:
+                    - input_ids: Pre-tokenized text [B, seq_len]
+                    - task_descriptions: Raw text strings (list[str]) to be tokenized
                 - actions: Ground truth actions
-                
+
         Returns:
             Dictionary with loss and metrics
         """
@@ -458,8 +460,34 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
 
         target_dtype = self._get_target_dtype()
         pixel_values = observations["pixel_values"].to(dtype=target_dtype)
-        input_ids = observations["input_ids"]
         image_mask = observations.get("image_mask")
+
+        # Handle both pre-tokenized input_ids and raw task_descriptions
+        if "input_ids" in observations:
+            input_ids = observations["input_ids"]
+        elif "task_descriptions" in observations:
+            # Tokenize task descriptions
+            task_desc = observations["task_descriptions"]
+            batch_size = actions.shape[0]
+
+            if isinstance(task_desc, str):
+                task_desc = [task_desc] * batch_size
+            elif isinstance(task_desc, list):
+                if len(task_desc) == 1 and batch_size > 1:
+                    task_desc = task_desc * batch_size
+            else:
+                task_desc = [str(task_desc)] * batch_size
+
+            tokenized = self.tokenizer(
+                task_desc,
+                padding="max_length",
+                truncation=True,
+                max_length=self.tokenizer_max_length,
+                return_tensors="pt",
+            )
+            input_ids = tokenized.input_ids.to(actions.device)
+        else:
+            raise ValueError("observations must contain either 'input_ids' or 'task_descriptions'")
 
         if pixel_values.dim() == 4:
             pixel_values = pixel_values.unsqueeze(1)

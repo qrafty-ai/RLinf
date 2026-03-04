@@ -1,0 +1,188 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Data loader for XVLA SFT training with LeRobot datasets."""
+
+from typing import Any, Optional
+
+import torch
+from omegaconf import DictConfig
+from torch.utils.data import DataLoader, Dataset
+
+from rlinf.utils.logging import get_logger
+
+logger = get_logger()
+
+
+class XVLADataLoader:
+    """Data loader wrapper for XVLA that yields (observation, actions) batches."""
+
+    def __init__(
+        self,
+        data_paths: list[str],
+        batch_size: int,
+        model_config: DictConfig,
+        num_workers: int = 4,
+    ):
+        """Initialize XVLA data loader.
+
+        Args:
+            data_paths: List of paths to LeRobot datasets
+            batch_size: Batch size for training
+            model_config: Model configuration containing XVLA settings
+            num_workers: Number of data loading workers
+        """
+        self.data_paths = data_paths
+        self.batch_size = batch_size
+        self.model_config = model_config
+        self.num_workers = num_workers
+        self._data_iter = None
+
+        # Import LeRobot dependencies
+        try:
+            from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+            self.LeRobotDataset = LeRobotDataset
+        except ImportError as e:
+            raise ImportError(
+                "LeRobot is required for XVLA SFT. "
+                "Install with: pip install lerobot"
+            ) from e
+
+        # Initialize dataset
+        self.dataset = self._create_dataset()
+        self.dataloader = self._create_dataloader()
+
+    def _create_dataset(self) -> Dataset:
+        """Create LeRobot dataset from data paths."""
+        if len(self.data_paths) == 0:
+            raise ValueError("No data paths provided for XVLA SFT")
+
+        # Use first data path as the repo_id
+        repo_id = self.data_paths[0]
+
+        logger.info(f"Loading XVLA dataset from: {repo_id}")
+
+        # Get XVLA config
+        xvla_cfg = getattr(self.model_config, "xvla", self.model_config)
+        config_name = getattr(xvla_cfg, "config_name", "xvla_libero")
+
+        # Create dataset
+        dataset = self.LeRobotDataset(
+            repo_id=repo_id,
+            delta_timestamps={
+                "observation.image": [0.0],
+                "observation.wrist_image": [0.0],
+                "observation.state": [0.0],
+                "action": list(range(0, 32)),  # chunk_size = 32
+            },
+        )
+
+        logger.info(f"Loaded dataset with {len(dataset)} frames")
+        return dataset
+
+    def _create_dataloader(self) -> DataLoader:
+        """Create PyTorch DataLoader."""
+        return DataLoader(
+            self.dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
+
+    def __iter__(self):
+        """Iterate over batches."""
+        for batch in self.dataloader:
+            yield self._process_batch(batch)
+
+    def _process_batch(self, batch: dict[str, Any]) -> tuple[dict[str, Any], torch.Tensor]:
+        """Process LeRobot batch to XVLA format.
+
+        Args:
+            batch: LeRobot batch with keys like observation.image, action, etc.
+
+        Returns:
+            Tuple of (observation dict, actions tensor)
+        """
+        # Extract images
+        main_image = batch["observation.image"]  # [B, C, H, W]
+        wrist_image = batch.get("observation.wrist_image")
+
+        # Stack images: [B, V, C, H, W] where V is number of views
+        if wrist_image is not None:
+            pixel_values = torch.stack([main_image, wrist_image], dim=1)
+        else:
+            pixel_values = main_image.unsqueeze(1)  # [B, 1, C, H, W]
+
+        # Extract proprioception (state)
+        proprio = batch.get("observation.state")  # [B, state_dim]
+
+        # Extract task description (language instruction)
+        task_descriptions = batch.get("task", [""] * pixel_values.shape[0])
+        if isinstance(task_descriptions, torch.Tensor):
+            task_descriptions = task_descriptions.tolist()
+
+        # Create image mask
+        batch_size = pixel_values.shape[0]
+        num_views = pixel_values.shape[1]
+        image_mask = torch.ones(batch_size, num_views, dtype=torch.bool)
+
+        # Build observation dict
+        # Note: input_ids (tokenized text) will be generated by the model during forward pass
+        # The model's sft_forward expects task_descriptions to be present for tokenization
+        observation = {
+            "pixel_values": pixel_values,
+            "image_mask": image_mask,
+            "proprio": proprio,
+            "task_descriptions": task_descriptions,
+        }
+
+        # Extract actions
+        actions = batch["action"]  # [B, chunk_size, action_dim]
+
+        return observation, actions
+
+    def __len__(self) -> int:
+        """Return number of batches."""
+        return len(self.dataloader)
+
+    def data_config(self) -> Optional[Any]:
+        """Return data config (for compatibility with OpenPI interface)."""
+        return None
+
+
+def create_xvla_data_loader(
+    data_paths: list[str],
+    batch_size: int,
+    model_config: DictConfig,
+    num_workers: int = 4,
+) -> XVLADataLoader:
+    """Factory function to create XVLA data loader.
+
+    Args:
+        data_paths: List of paths to LeRobot datasets
+        batch_size: Batch size for training
+        model_config: Model configuration
+        num_workers: Number of data loading workers
+
+    Returns:
+        XVLADataLoader instance
+    """
+    return XVLADataLoader(
+        data_paths=data_paths,
+        batch_size=batch_size,
+        model_config=model_config,
+        num_workers=num_workers,
+    )

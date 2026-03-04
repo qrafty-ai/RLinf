@@ -28,7 +28,9 @@ class FSDPVlaSftWorker(FSDPSftWorker):
         super().__init__(cfg)
 
     def build_dataloader(self, data_paths: list[str], eval_dataset: bool = False):
-        if SupportedModel(self.cfg.actor.model.model_type) in [SupportedModel.OPENPI]:
+        model_type = SupportedModel(self.cfg.actor.model.model_type)
+
+        if model_type == SupportedModel.OPENPI:
             import openpi.training.data_loader as openpi_data_loader
 
             from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
@@ -42,6 +44,19 @@ class FSDPVlaSftWorker(FSDPSftWorker):
                 config, framework="pytorch", shuffle=True
             )
             return data_loader, data_loader.data_config()
+
+        elif model_type == SupportedModel.XVLA:
+            # XVLA uses LeRobot dataset format
+            from rlinf.workers.sft.xvla_data_loader import create_xvla_data_loader
+
+            data_loader = create_xvla_data_loader(
+                data_paths=data_paths,
+                batch_size=self.cfg.actor.micro_batch_size * self._world_size,
+                model_config=self.cfg.actor.model,
+                num_workers=getattr(self.cfg.data, "num_workers", 4),
+            )
+            return data_loader, None
+
         else:
             raise KeyError(
                 f"not support such model type {self.cfg.actor.model.model_type} for SFT right now."
