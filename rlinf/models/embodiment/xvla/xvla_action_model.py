@@ -14,11 +14,13 @@
 
 """XVLA (Flow-Matching Vision-Language-Action) model for embodied RL.
 
-Uses HuggingFace Transformers Florence2 as the backbone with a custom
-SoftPromptedTransformer policy head for flow-matching action generation.
+Builds on top of `lerobot.policies.xvla.modeling_xvla.XVLAModel` for core
+XVLA model construction and flow-matching generation, while adding RLinf
+interfaces (input/output transform, RL log-prob/value computation, and
+checkpoint compatibility helpers).
 """
 
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, cast
 
 import numpy as np
 import torch
@@ -27,19 +29,42 @@ import torch.nn.functional as F
 from transformers import BartTokenizerFast
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
-from rlinf.models.embodiment.xvla.configuration_xvla import XVLAConfig
-from rlinf.models.embodiment.xvla.soft_transformer import (
-    SoftPromptedTransformer,
-    ValueHead,
-)
-from rlinf.models.embodiment.xvla.action_space import build_action_space
 from rlinf.utils.logging import get_logger
 
-# Import custom Florence2 implementation (not from transformers to avoid dependency issues)
-from rlinf.models.embodiment.xvla.modeling_florence2 import (
-    Florence2ForConditionalGeneration,
-    Florence2Config,
-)
+# Import from lerobot directly
+from lerobot.policies.xvla.configuration_xvla import XVLAConfig
+from lerobot.policies.xvla.modeling_xvla import XVLAModel
+from lerobot.policies.xvla.utils import rotate6d_to_axis_angle
+
+
+class ValueHead(nn.Module):
+    """Value head for PPO (predicts scalar value from features).
+
+    Simple MLP that takes pooled visual features and outputs a value estimate.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int) -> None:
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        x : Tensor
+            [batch_size, input_dim] pooled features
+
+        Returns
+        -------
+        Tensor
+            [batch_size, 1] value estimates
+        """
+        return self.network(x)
 
 
 class XVLAForRLActionPrediction(nn.Module, BasePolicy):
@@ -49,14 +74,26 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
     1. Florence2 VLM (frozen): DaViT vision + BART language encoder
     2. SoftPromptedTransformer (trainable): Policy head with domain soft prompts
     3. Flow-matching sampler: Generate actions via iterative denoising
+    
+    Uses lerobot's XVLA implementation directly for checkpoint compatibility.
     """
     
-    def __init__(self, config: XVLAConfig, proprio_dim: int = 0):
+    def __init__(
+        self, 
+        config: XVLAConfig, 
+        proprio_dim: int = 0,
+        config_name: Optional[str] = None,
+        domain_id: int = 0,
+        add_value_head: bool = False,
+    ):
         """Initialize XVLA model.
         
         Args:
-            config: XVLA configuration
+            config: XVLA configuration (from lerobot)
             proprio_dim: Proprioception dimension (0 if not used)
+            config_name: Config name for logging
+            domain_id: Domain ID for multi-domain training
+            add_value_head: Whether to add value head for PPO
         """
         super().__init__()
         
@@ -65,49 +102,29 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         self.proprio_dim = proprio_dim
         self.chunk_size = config.chunk_size
         self.use_proprio = config.use_proprio
-        
-        # Build Florence2 config from nested structure
-        florence_config = self._build_florence_config()
-        
-        # 1. Initialize Florence2 VLM
-        self.vlm = Florence2ForConditionalGeneration(florence_config)
-        
-        # 2. Remove unused BART decoder to save memory
-        self._remove_unused_decoder()
-        
-        projection_dim = florence_config.projection_dim
+        self.config_name = config_name or "xvla"
+        self.domain_id = domain_id
+        self.num_denoising_steps = config.num_denoising_steps
+        self.add_value_head = add_value_head
 
-        # 3. Action space for preprocessing/postprocessing
-        if config.action_mode.lower() == "auto":
-            action_feature = getattr(config, "action_feature", None)
-            real_dim = action_feature.shape[-1] if action_feature is not None else config.max_action_dim
-            self.action_space = build_action_space(
-                config.action_mode.lower(),
-                real_dim=real_dim,
-                max_dim=config.max_action_dim,
-            )
-        else:
-            self.action_space = build_action_space(config.action_mode.lower())
-        self.dim_action = self.action_space.dim_action
-
-        # 4. Initialize SoftPromptedTransformer policy head
-        self.policy_head = SoftPromptedTransformer(
-            hidden_size=config.hidden_size,
-            multi_modal_input_size=projection_dim,
-            depth=config.depth,
-            num_heads=config.num_heads,
-            mlp_ratio=config.mlp_ratio,
-            num_domains=config.num_domains,
-            len_soft_prompts=config.len_soft_prompts,
-            dim_time=config.dim_time,
-            dim_action=self.dim_action,
-            dim_propio=proprio_dim,
-            max_len_seq=config.max_len_seq,
-            use_hetero_proj=config.use_hetero_proj,
+        florence_config = config.get_florence_config()
+        xvla_model = XVLAModel(
+            config=config,
+            florence_config=florence_config,
+            proprio_dim=proprio_dim,
         )
+        self._xvla_model: XVLAModel
+        object.__setattr__(self, "_xvla_model", xvla_model)
+
+        # Keep historical attribute names for checkpoint compatibility.
+        self.vlm = xvla_model.vlm
+        self.policy_head = xvla_model.transformer
+        self.action_space = xvla_model.action_space
+        self.dim_action = xvla_model.dim_action
+        projection_dim = xvla_model.vlm.config.projection_dim
         
         # 5. Optional value head for PPO
-        if config.add_value_head:
+        if add_value_head:
             self.value_head = ValueHead(
                 input_dim=projection_dim,
                 hidden_dim=config.hidden_size,
@@ -115,86 +132,106 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         else:
             self.value_head = None
         
-        # 6. Apply freezing
-        self._apply_freezing()
-
-        # 7. Apply dtype
-        self._apply_dtype()
-
-        # 8. Initialize BART tokenizer for language instructions
+        # Initialize BART tokenizer for language instructions.
         self.tokenizer = BartTokenizerFast.from_pretrained(
             config.tokenizer_name,
             padding_side=config.tokenizer_padding_side,
         )
         self.tokenizer_max_length = config.tokenizer_max_length
+        self._apply_dtype()
         
-        self.logger.info(f"Initialized XVLA model with config: {config.config_name}")
+        self.logger.info(f"Initialized XVLA model with config: {self.config_name}")
         self.logger.info(f"  Florence2 projection dim: {projection_dim}")
         self.logger.info(f"  Policy head hidden size: {config.hidden_size}")
         self.logger.info(f"  Action dimension: {self.dim_action}")
         self.logger.info(f"  Proprio dimension: {proprio_dim}")
-        self.logger.info(f"  Domain ID: {config.domain_id}")
+        self.logger.info(f"  Domain ID: {domain_id}")
         self.logger.info(f"  Tokenizer: {config.tokenizer_name} (max_length={config.tokenizer_max_length})")
     
-    def _build_florence_config(self) -> Florence2Config:
-        """Build Florence2Config from nested config dict."""
-        from omegaconf import DictConfig, OmegaConf
-
-        florence_cfg = self.config.florence_config
-        if isinstance(florence_cfg, DictConfig):
-            config_dict = OmegaConf.to_container(florence_cfg, resolve=True)
-        else:
-            config_dict = dict(florence_cfg)
-
-        return Florence2Config(**config_dict)
-    
-    def _remove_unused_decoder(self):
-        """Remove BART decoder from Florence2 to save memory.
+    @classmethod
+    def from_lerobot_policy(cls, lerobot_policy, config_name: str = "xvla", add_value_head: bool = False):
+        """Create XVLAForRLActionPrediction from a LeRobot XVLAPolicy.
         
-        XVLA only uses the encoder for visual-language features.
+        This allows loading LeRobot checkpoints directly without conversion.
+        
+        Args:
+            lerobot_policy: LeRobot XVLAPolicy instance (loaded via from_pretrained)
+            config_name: Config name for logging
+            add_value_head: Whether to add value head for PPO
+            
+        Returns:
+            XVLAForRLActionPrediction instance with loaded weights from LeRobot policy
         """
-        if hasattr(self.vlm, "language_model"):
-            lm = self.vlm.language_model
-            if hasattr(lm, "model") and hasattr(lm.model, "decoder"):
-                del lm.model.decoder
-                self.logger.debug("Removed Florence2 decoder")
-            if hasattr(lm, "lm_head"):
-                del lm.lm_head
-                self.logger.debug("Removed Florence2 lm_head")
+        # Create instance without calling __init__ to avoid re-initializing components
+        instance = cls.__new__(cls)
+        nn.Module.__init__(instance)
+        
+        # Copy config and core components from LeRobot policy
+        if not hasattr(lerobot_policy, "model") or not isinstance(lerobot_policy.model, XVLAModel):
+            raise ValueError("Expected a LeRobot XVLAPolicy with a valid XVLAModel in `model`.")
+
+        xvla_model = lerobot_policy.model
+        instance.config = lerobot_policy.config
+        instance.logger = get_logger()
+        instance.proprio_dim = lerobot_policy.config.max_state_dim if lerobot_policy.config.use_proprio else 0
+        instance.chunk_size = lerobot_policy.config.chunk_size
+        instance.use_proprio = lerobot_policy.config.use_proprio
+        instance.config_name = config_name
+        instance.num_denoising_steps = lerobot_policy.config.num_denoising_steps
+        instance.add_value_head = add_value_head
+
+        object.__setattr__(instance, "_xvla_model", xvla_model)
+        instance.vlm = xvla_model.vlm
+        instance.policy_head = xvla_model.transformer
+        instance.action_space = xvla_model.action_space
+        instance.dim_action = xvla_model.dim_action
+
+        if hasattr(lerobot_policy, "tokenizer"):
+            instance.tokenizer = lerobot_policy.tokenizer
+        else:
+            instance.tokenizer = BartTokenizerFast.from_pretrained(
+                lerobot_policy.config.tokenizer_name,
+                padding_side=lerobot_policy.config.tokenizer_padding_side,
+            )
+        instance.tokenizer_max_length = lerobot_policy.config.tokenizer_max_length
+
+        # Set domain_id from config or default
+        instance.domain_id = getattr(lerobot_policy.config, "domain_id", 3)
+
+        # Add value head if requested
+        if add_value_head:
+            projection_dim = xvla_model.vlm.config.projection_dim
+            instance.value_head = ValueHead(
+                input_dim=projection_dim,
+                hidden_dim=lerobot_policy.config.hidden_size,
+            )
+            instance.value_head.to(dtype=xvla_model._get_target_dtype())
+        else:
+            instance.value_head = None
+        
+        instance.logger.info(f"Initialized XVLA model from LeRobot policy: {config_name}")
+        instance.logger.info(f"  Florence2 projection dim: {lerobot_policy.config.get_florence_config().projection_dim}")
+        instance.logger.info(f"  Policy head hidden size: {lerobot_policy.config.hidden_size}")
+        instance.logger.info(f"  Action dimension: {instance.dim_action}")
+        instance.logger.info(f"  Proprio dimension: {instance.proprio_dim}")
+        instance.logger.info(f"  Domain ID: {instance.domain_id}")
+        instance.logger.info(f"  Tokenizer: {lerobot_policy.config.tokenizer_name} (max_length={instance.tokenizer_max_length})")
+        
+        return instance
     
-    def _apply_freezing(self):
-        """Apply freezing based on config."""
-        if self.config.freeze_vision_encoder and hasattr(self.vlm, "vision_tower"):
-            for param in self.vlm.vision_tower.parameters():
-                param.requires_grad = False
-
-        if self.config.freeze_language_encoder and hasattr(self.vlm, "language_model"):
-            lm = self.vlm.language_model
-            if hasattr(lm, "model") and hasattr(lm.model, "encoder"):
-                for param in lm.model.encoder.parameters():
-                    param.requires_grad = False
-            if hasattr(lm, "model") and hasattr(lm.model, "shared"):
-                for param in lm.model.shared.parameters():
-                    param.requires_grad = False
-
-        if not self.config.train_policy_transformer:
-            for name, param in self.policy_head.named_parameters():
-                if "soft_prompt" not in name:
-                    param.requires_grad = False
-
-        if not self.config.train_soft_prompts and hasattr(self.policy_head, "soft_prompt_hub"):
-            for param in self.policy_head.soft_prompt_hub.parameters():
-                param.requires_grad = False
-
     def _get_target_dtype(self) -> torch.dtype:
-        """Get target dtype from config."""
-        if self.config.dtype == "bfloat16":
-            return torch.bfloat16
-        return torch.float32
+        """Get target dtype from core XVLA model config."""
+        return self._xvla_model._get_target_dtype()
 
     def _apply_dtype(self) -> None:
-        """Apply dtype casting to model components."""
-        self.to(dtype=self._get_target_dtype())
+        """Apply dtype casting to XVLA model and value head."""
+        self._xvla_model._apply_dtype()
+        if self.value_head is not None:
+            self.value_head.to(dtype=self._get_target_dtype())
+
+    def _apply_freezing(self) -> None:
+        """Apply freezing to core XVLA model."""
+        self._xvla_model._apply_freezing()
 
     def _get_default_image_mask(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """Create default all-valid image mask with shape [B, V]."""
@@ -267,7 +304,7 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
     def _prepare_domain_id(self, domain_id: Optional[torch.Tensor], batch_size: int, device: torch.device) -> torch.Tensor:
         """Normalize domain ids to [B] long tensor."""
         if domain_id is None:
-            return torch.full((batch_size,), self.config.domain_id, dtype=torch.long, device=device)
+            return torch.full((batch_size,), self.domain_id, dtype=torch.long, device=device)
 
         if not isinstance(domain_id, torch.Tensor):
             domain_id = torch.as_tensor(domain_id, device=device)
@@ -338,11 +375,18 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
             return action
 
         if target_dim == 7 and action.shape[-1] >= 10:
-            from rlinf.models.embodiment.xvla.rotation_utils import rotation_6d_to_axis_angle
-
             pos = action[..., :3]
             rot6d = action[..., 3:9]
-            axis_angle = rotation_6d_to_axis_angle(rot6d)
+            # Convert to float32 before numpy (BFloat16 not supported by numpy)
+            # Flatten to (N, 6) for rotation conversion
+            original_shape = rot6d.shape
+            flat_shape = (-1, 6)
+            rot6d_flat = rot6d.reshape(flat_shape)
+            rot6d_np = rot6d_flat.detach().cpu().to(torch.float32).numpy() if isinstance(rot6d_flat, torch.Tensor) else rot6d_flat
+            axis_angle_np = rotate6d_to_axis_angle(rot6d_np)
+            # Reshape back to original dimensions except last which is now 3
+            axis_angle = torch.from_numpy(axis_angle_np).to(action.device, action.dtype)
+            axis_angle = axis_angle.reshape(*original_shape[:-1], 3)
             gripper = action[..., 9:10]
             return torch.cat([pos, axis_angle, gripper], dim=-1)
 
@@ -393,9 +437,15 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         if pixel_values.dim() == 4:
             pixel_values = pixel_values.unsqueeze(1)
         image_mask = self._prepare_image_mask(image_mask, pixel_values)
-        return self.forward_vlm(input_ids=input_ids, pixel_values=pixel_values, image_mask=image_mask)
+        input_ids_long = cast(torch.LongTensor, input_ids.to(dtype=torch.long))
+        pixel_values_float = cast(torch.FloatTensor, pixel_values.to(dtype=self._get_target_dtype()))
+        return self._xvla_model.forward_vlm(
+            input_ids=input_ids_long,
+            pixel_values=pixel_values_float,
+            image_mask=image_mask,
+        )
     
-    def forward(
+    def forward(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         forward_type: ForwardType = ForwardType.DEFAULT,
         **kwargs
@@ -447,34 +497,24 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         domain_id = self._prepare_domain_id(observations.get("domain_id"), batch_size, actions.device)
 
         action_target = actions.to(dtype=target_dtype)
-        enc = self._get_vlm_features(pixel_values, input_ids, image_mask)
-
-        t = (
-            torch.rand(1, device=actions.device, dtype=target_dtype)
-            + torch.arange(batch_size, device=actions.device, dtype=target_dtype) / batch_size
-        ) % (1 - 1e-5)
-
-        action_noisy = torch.randn_like(action_target) * t.view(-1, 1, 1) + action_target * (1 - t).view(-1, 1, 1)
-        proprio_m, action_noisy_m = self.action_space.preprocess(proprio, action_noisy)
-
-        pred_action = self.policy_head(
-            domain_id=domain_id,
-            action_with_noise=action_noisy_m,
-            proprio=proprio_m,
-            t=t,
-            **enc,
+        loss_dict = self._xvla_model(
+            input_ids=cast(torch.LongTensor, input_ids.to(dtype=torch.long)),
+            image_input=cast(torch.FloatTensor, pixel_values),
+            image_mask=image_mask,
+            domain_id=cast(torch.LongTensor, domain_id.to(dtype=torch.long)),
+            proprio=proprio,
+            action=action_target,
         )
 
-        loss_dict = self.action_space.compute_loss(pred_action, action_target)
-        total_loss = sum(loss_dict.values())
+        total_loss = torch.stack(list(loss_dict.values())).sum()
 
         metrics = {name: value.detach().item() for name, value in loss_dict.items()}
         metrics["sft_loss"] = total_loss.detach().item()
         return {"loss": total_loss, "metrics": metrics}
     
-    def default_forward(
+    def default_forward(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
-        forward_inputs: dict[str, torch.Tensor],
+        forward_inputs: dict[str, Any],
         **kwargs
     ) -> dict[str, Any]:
         """Default RL forward pass for computing log-probs and values.
@@ -497,7 +537,7 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         num_steps = chains.shape[1]
 
         pixel_values = observations["pixel_values"].to(dtype=target_dtype)
-        input_ids = observations["input_ids"]
+        input_ids = observations["input_ids"].to(dtype=torch.long)
         image_mask = self._prepare_image_mask(observations.get("image_mask"), pixel_values)
         proprio = self._prepare_proprio(
             observations.get("proprio"),
@@ -558,39 +598,17 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         """
         Encode text and multi-view images via Florence2 encoder.
         """
-        batch_size, num_views = pixel_values.shape[:2]
-        flat_mask = image_mask.view(-1).to(dtype=torch.bool)
-        flat_images = pixel_values.flatten(0, 1)
-        num_valid = int(flat_mask.sum().item())
-        if num_valid == 0:
-            raise ValueError("At least one image view must be valid per batch.")
-
-        valid_images = flat_images[flat_mask]
-        valid_feats = self.vlm._encode_image(valid_images)
-        tokens_per_view, hidden_dim = valid_feats.shape[1:]
-
-        image_features = valid_feats.new_zeros((batch_size * num_views, tokens_per_view, hidden_dim))
-        image_features[flat_mask] = valid_feats
-        image_features = image_features.view(batch_size, num_views, tokens_per_view, hidden_dim)
-        inputs_embeds = self.vlm.get_input_embeddings()(input_ids)
-        merged_embeds, attention_mask = self.vlm._merge_input_ids_with_image_features(
-            image_features[:, 0],
-            inputs_embeds,
+        return self._xvla_model.forward_vlm(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            image_mask=image_mask,
         )
 
-        enc_out = self.vlm.language_model.model.encoder(
-            attention_mask=attention_mask,
-            inputs_embeds=merged_embeds,
-        )[0]
-
-        aux_visual_inputs = image_features[:, 1:].reshape(batch_size, -1, hidden_dim)
-        return {"vlm_features": enc_out, "aux_visual_inputs": aux_visual_inputs}
-
-    def predict_action_batch(
+    def predict_action_batch(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         env_obs: dict[str, Any],
         mode: Literal["train", "eval"] = "eval",
-        sampling_params: Optional[dict] = None,
+        sampling_params: Optional[dict[str, Any]] = None,
         **kwargs
     ) -> tuple[torch.Tensor, None]:
         """Generate actions for rollout (inference).
@@ -598,7 +616,7 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         Args:
             env_obs: Observation dictionary with images, states, prompts
             mode: "train" or "eval" mode
-            sampling_params: Unused for XVLA (kept for API compatibility)
+            sampling_params: Optional sampling parameters (e.g., num_steps)
             
         Returns:
             Tuple of (actions, None)
@@ -622,44 +640,28 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         domain_id = self._prepare_domain_id(transformed_obs.get("domain_id"), batch_size, device)
         pixel_values = pixel_values.to(dtype=target_dtype)
 
-        with torch.no_grad():
-            enc = self.forward_vlm(input_ids, pixel_values, image_mask)
-
-        actions = torch.zeros(
-            batch_size,
-            self.chunk_size,
-            self.dim_action,
-            device=device,
-            dtype=target_dtype,
-        )
-        x1 = torch.randn_like(actions)
-
-        steps = self.config.num_steps
+        steps = self.num_denoising_steps
         if sampling_params is not None and "num_steps" in sampling_params:
             steps = int(sampling_params["num_steps"])
-        steps = max(1, steps)
 
-        for i in range(steps, 0, -1):
-            t = torch.full(
-                (batch_size,),
-                float(i) / float(steps),
-                device=device,
-                dtype=actions.dtype,
-            )
-            t_expanded = t.view(-1, 1, 1)
-            x_t = x1 * t_expanded + actions * (1.0 - t_expanded)
-            proprio_m, x_t_m = self.action_space.preprocess(proprio, x_t)
-            actions = self.policy_head(
-                domain_id=domain_id,
-                action_with_noise=x_t_m,
-                proprio=proprio_m,
-                t=t,
-                **enc
+        self.logger.info(f"Predicting actions with XVLA: mode={mode}, num_steps={steps}")
+
+        with torch.no_grad():
+            domain_id_long = cast(torch.LongTensor, domain_id.to(dtype=torch.long))
+            actions = self._xvla_model.generate_actions(
+                input_ids=input_ids.to(dtype=torch.long),
+                image_input=pixel_values,
+                image_mask=image_mask,
+                domain_id=domain_id_long,
+                proprio=proprio,
+                steps=steps,
             )
 
-        actions = self.action_space.postprocess(actions)
+        self.logger.info(f"Generated actions with shape {actions.shape} and dtype {actions.dtype}")
+        self.logger.info(f"action: {actions.cpu().numpy()}")
         target_dim = self._infer_target_action_dim(env_obs=env_obs, action=actions)
         actions = self._convert_action_to_target_dim(actions, target_dim)
+        self.logger.info(f"shape after processing: {actions.shape}, dtype={actions.dtype}")
         return actions.to(dtype=torch.float32), None
     
     def sample_actions(
@@ -717,7 +719,7 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
             "proprio": state,
             "domain_id": torch.full(
                 (lang_tokens.shape[0],),
-                self.config.domain_id,
+                self.domain_id,
                 dtype=torch.long,
                 device=lang_tokens.device,
             ),
@@ -803,7 +805,7 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         pixel_values = torch.stack(images, dim=1)
         image_mask = torch.ones(batch_size, pixel_values.shape[1], dtype=torch.bool, device=pixel_values.device)
 
-        total_views = self.config.num_images_in_input or pixel_values.shape[1]
+        total_views = getattr(self.config, "num_image_views", None) or pixel_values.shape[1]
         total_views = max(total_views, pixel_values.shape[1])
         if total_views > pixel_values.shape[1]:
             pad_views = total_views - pixel_values.shape[1]
@@ -877,125 +879,3 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
                     processed_obs[key] = value.to(dtype=dtype, device=device)
         
         return processed_obs
-    
-    def load_checkpoint(self, checkpoint_path: str, strict: bool = True):
-        """Load checkpoint weights.
-        
-        Args:
-            checkpoint_path: Path to checkpoint file (.safetensors or .bin)
-            strict: Whether to strictly enforce matching keys
-        """
-        if checkpoint_path.endswith(".safetensors"):
-            try:
-                from safetensors.torch import load_file
-                state_dict = load_file(checkpoint_path)
-            except ImportError:
-                raise ImportError("safetensors is required to load .safetensors files")
-        else:
-            state_dict = torch.load(checkpoint_path, map_location="cpu")
-
-        remapped_state_dict: dict[str, torch.Tensor] = {}
-        model_state_dict = self.state_dict()
-
-        alias_map = {
-            # Legacy/LeRobot naming → RLinf DomainAwareLinear naming
-            "policy_head.action_in_proj.weight": "policy_head.action_encoder.fc.weight",
-            "policy_head.action_in_proj.bias": "policy_head.action_encoder.bias.weight",
-            "policy_head.action_out_proj.weight": "policy_head.action_decoder.fc.weight",
-            "policy_head.action_out_proj.bias": "policy_head.action_decoder.bias.weight",
-            # For non-hetero (nn.Linear) case
-            "policy_head.input_proj.weight": "policy_head.vlm_proj.weight",
-            "policy_head.input_proj.bias": "policy_head.vlm_proj.bias",
-            # For hetero (DomainAwareLinear) case
-            "policy_head.input_proj.fc.weight": "policy_head.vlm_proj.fc.weight",
-            "policy_head.input_proj.bias.weight": "policy_head.vlm_proj.bias.weight",
-            "policy_head.soft_prompt_hub.soft_prompts": "policy_head.soft_prompt_hub.weight",
-        }
-
-        def _map_key(key: str) -> str | None:
-            mapped = key
-            if mapped.startswith("model."):
-                mapped = mapped[6:]
-                if mapped.startswith("transformer."):
-                    mapped = "policy_head." + mapped[len("transformer.") :]
-
-            mapped = alias_map.get(mapped, mapped)
-
-            if ".mlp.0." in mapped:
-                mapped = mapped.replace(".mlp.0.", ".mlp.fc1.")
-            if ".mlp.2." in mapped:
-                mapped = mapped.replace(".mlp.2.", ".mlp.fc2.")
-            if ".mlp.3." in mapped:
-                mapped = mapped.replace(".mlp.3.", ".mlp.fc2.")
-
-            # Handle DomainAwareLinear bias (Embedding layer stores as .bias.weight)
-            if mapped.startswith("policy_head.action_encoder.bias") and not mapped.endswith(".weight"):
-                mapped = mapped.replace("policy_head.action_encoder.bias", "policy_head.action_encoder.bias.weight")
-            if mapped.startswith("policy_head.action_decoder.bias") and not mapped.endswith(".weight"):
-                mapped = mapped.replace("policy_head.action_decoder.bias", "policy_head.action_decoder.bias.weight")
-            # Handle nn.Linear bias for non-hetero vlm_proj
-            if mapped.startswith("policy_head.vlm_proj.bias") and not mapped.endswith(".weight") and "fc" not in mapped:
-                mapped = mapped.replace("policy_head.vlm_proj.bias", "policy_head.vlm_proj.bias")
-            # Handle DomainAwareLinear bias for hetero vlm_proj
-            if mapped.startswith("policy_head.vlm_proj.bias") and not mapped.endswith(".weight") and "fc" in mapped:
-                mapped = mapped.replace("policy_head.vlm_proj.bias.weight", "policy_head.vlm_proj.bias.weight")
-
-            if mapped == "policy_head.soft_prompt_hub.soft_prompts":
-                mapped = "policy_head.soft_prompt_hub.weight"
-
-            return mapped
-
-        shape_mismatch: list[tuple[str, torch.Size, torch.Size]] = []
-        unexpected_source: list[str] = []
-
-        for key, value in state_dict.items():
-            new_key = _map_key(key)
-            if new_key is None:
-                continue
-
-            if new_key == "policy_head.soft_prompt_hub.weight" and value.dim() == 3:
-                value = value.reshape(value.shape[0], -1)
-
-            if new_key in model_state_dict:
-                expected_shape = model_state_dict[new_key].shape
-                if value.shape != expected_shape:
-                    shape_mismatch.append((new_key, value.shape, expected_shape))
-                    continue
-
-                remapped_state_dict[new_key] = value
-            else:
-                unexpected_source.append(key)
-
-        # Fill shared embedding when only encoder embedding exists in checkpoint.
-        shared_key = "vlm.language_model.model.shared.weight"
-        encoder_embed_key = "vlm.language_model.model.encoder.embed_tokens.weight"
-        if shared_key in model_state_dict and shared_key not in remapped_state_dict:
-            if encoder_embed_key in remapped_state_dict:
-                remapped_state_dict[shared_key] = remapped_state_dict[encoder_embed_key]
-
-        if shape_mismatch:
-            preview = ", ".join(
-                [f"{name}: ckpt={tuple(src)} model={tuple(dst)}" for name, src, dst in shape_mismatch[:5]]
-            )
-            raise RuntimeError(
-                f"Checkpoint has shape mismatches for {len(shape_mismatch)} parameters. {preview}"
-            )
-
-        missing_keys, unexpected_keys = self.load_state_dict(remapped_state_dict, strict=strict)
-
-        if strict and (missing_keys or unexpected_keys):
-            raise RuntimeError(
-                f"Strict load failed. Missing={len(missing_keys)} Unexpected={len(unexpected_keys)}"
-            )
-
-        if unexpected_source:
-            self.logger.warning(
-                "Ignored %d source keys that do not map to model parameters",
-                len(unexpected_source),
-            )
-
-        self.logger.info(f"Loaded checkpoint from {checkpoint_path}")
-
-        loaded_count = len(remapped_state_dict)
-        total_count = len(model_state_dict)
-        self.logger.info(f"Loaded {loaded_count}/{total_count} parameters ({100*loaded_count//total_count}%)")
