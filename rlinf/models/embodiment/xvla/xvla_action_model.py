@@ -36,6 +36,8 @@ from lerobot.policies.xvla.configuration_xvla import XVLAConfig
 from lerobot.policies.xvla.modeling_xvla import XVLAModel
 from lerobot.policies.xvla.utils import rotate6d_to_axis_angle
 
+from .adapter import XVLAAdapter
+
 
 class ValueHead(nn.Module):
     """Value head for PPO (predicts scalar value from features).
@@ -85,6 +87,7 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         config_name: Optional[str] = None,
         domain_id: int = 0,
         add_value_head: bool = False,
+        adapter: Optional[XVLAAdapter] = None,
     ):
         """Initialize XVLA model.
         
@@ -94,6 +97,7 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
             config_name: Config name for logging
             domain_id: Domain ID for multi-domain training
             add_value_head: Whether to add value head for PPO
+            adapter: Optional adapter for input/output transformation
         """
         super().__init__()
         
@@ -106,6 +110,7 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         self.domain_id = domain_id
         self.num_denoising_steps = config.num_denoising_steps
         self.add_value_head = add_value_head
+        self.adapter = adapter
 
         florence_config = config.get_florence_config()
         xvla_model = XVLAModel(
@@ -149,7 +154,7 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         self.logger.info(f"  Tokenizer: {config.tokenizer_name} (max_length={config.tokenizer_max_length})")
     
     @classmethod
-    def from_lerobot_policy(cls, lerobot_policy, config_name: str = "xvla", add_value_head: bool = False):
+    def from_lerobot_policy(cls, lerobot_policy, config_name: str = "xvla", add_value_head: bool = False, adapter: Optional[XVLAAdapter] = None):
         """Create XVLAForRLActionPrediction from a LeRobot XVLAPolicy.
         
         This allows loading LeRobot checkpoints directly without conversion.
@@ -158,6 +163,7 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
             lerobot_policy: LeRobot XVLAPolicy instance (loaded via from_pretrained)
             config_name: Config name for logging
             add_value_head: Whether to add value head for PPO
+            adapter: Optional adapter for input/output transformation
             
         Returns:
             XVLAForRLActionPrediction instance with loaded weights from LeRobot policy
@@ -179,6 +185,7 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         instance.config_name = config_name
         instance.num_denoising_steps = lerobot_policy.config.num_denoising_steps
         instance.add_value_head = add_value_head
+        instance.adapter = adapter
 
         object.__setattr__(instance, "_xvla_model", xvla_model)
         instance.vlm = xvla_model.vlm
@@ -271,35 +278,6 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
             image_mask = image_mask[:, : pixel_values.shape[1]]
 
         return image_mask.to(device=pixel_values.device, dtype=torch.bool)
-
-    def _prepare_proprio(
-        self,
-        proprio: Optional[torch.Tensor],
-        batch_size: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Normalize proprio to [B, proprio_dim] tensor."""
-        if proprio is None:
-            return torch.zeros(batch_size, self.proprio_dim, device=device, dtype=dtype)
-
-        if isinstance(proprio, np.ndarray):
-            proprio = torch.from_numpy(proprio)
-
-        proprio = proprio.to(device=device, dtype=dtype)
-        if proprio.dim() == 1:
-            proprio = proprio.unsqueeze(0)
-
-        if proprio.shape[0] != batch_size:
-            proprio = proprio.expand(batch_size, -1)
-
-        if proprio.shape[-1] < self.proprio_dim:
-            pad = torch.zeros(batch_size, self.proprio_dim - proprio.shape[-1], device=device, dtype=dtype)
-            proprio = torch.cat([proprio, pad], dim=-1)
-        elif proprio.shape[-1] > self.proprio_dim:
-            proprio = proprio[..., : self.proprio_dim]
-
-        return proprio
 
     def _prepare_domain_id(self, domain_id: Optional[torch.Tensor], batch_size: int, device: torch.device) -> torch.Tensor:
         """Normalize domain ids to [B] long tensor."""
@@ -625,26 +603,19 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
 
         pixel_values = transformed_obs["pixel_values"]
         input_ids = transformed_obs["input_ids"]
-        image_mask = self._prepare_image_mask(transformed_obs.get("image_mask"), pixel_values)
+        image_mask = transformed_obs["image_mask"]
 
-        batch_size = pixel_values.shape[0]
         target_dtype = self._get_target_dtype()
-        device = pixel_values.device
 
-        proprio = self._prepare_proprio(
-            transformed_obs.get("proprio"),
-            batch_size=batch_size,
-            device=device,
-            dtype=target_dtype,
-        )
-        domain_id = self._prepare_domain_id(transformed_obs.get("domain_id"), batch_size, device)
+        proprio = transformed_obs["proprio"]
+        domain_id = transformed_obs["domain_id"]
         pixel_values = pixel_values.to(dtype=target_dtype)
 
+        self.logger.info(f"proprio: {proprio}, domain_id: {domain_id}")
+        self.logger.info(f"pixel shape: {pixel_values.shape}, dtype={pixel_values.dtype}")
         steps = self.num_denoising_steps
         if sampling_params is not None and "num_steps" in sampling_params:
             steps = int(sampling_params["num_steps"])
-
-        self.logger.info(f"Predicting actions with XVLA: mode={mode}, num_steps={steps}")
 
         with torch.no_grad():
             domain_id_long = cast(torch.LongTensor, domain_id.to(dtype=torch.long))
@@ -657,10 +628,18 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
                 steps=steps,
             )
 
-        self.logger.info(f"Generated actions with shape {actions.shape} and dtype {actions.dtype}")
-        self.logger.info(f"action: {actions.cpu().numpy()}")
-        target_dim = self._infer_target_action_dim(env_obs=env_obs, action=actions)
-        actions = self._convert_action_to_target_dim(actions, target_dim)
+        if self.adapter is None:
+            raise RuntimeError(
+                "XVLA adapter is not configured. "
+                "Please enable the adapter in your config:\n"
+                "  xvla:\n"
+                "    adapter:\n"
+                "      simulator: \"libero\"\n"
+                "This is required for proper input/output transformation."
+            )
+
+        actions = self.adapter.transform_output(actions)
+
         self.logger.info(f"shape after processing: {actions.shape}, dtype={actions.dtype}")
         return actions.to(dtype=torch.float32), None
     
@@ -756,76 +735,38 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
     def input_transform(
         self,
         env_obs: dict[str, Any],
-        transpose: bool = False
     ) -> dict[str, Any]:
         """Transform environment observations to model format.
-        
-        Combines obs_processor and input_transform into a single method.
-        Handles generic conversion to model-ready tensors.
-        
+
+        When adapter is used, it returns pre-processed tensors directly.
+        Otherwise, processes raw environment observations.
+
         Args:
             env_obs: Environment observation dictionary with images, states, task_descriptions
-            transpose: Whether to transpose dimensions (not used)
-            
+
         Returns:
             Dictionary with pixel_values, input_ids, attention_mask, proprio, domain_id
         """
-        del transpose
-
         device = next(self.parameters()).device
         target_dtype = self._get_target_dtype()
 
-        image_keys = [key for key in env_obs.keys() if "image" in key and env_obs[key] is not None]
-        if len(image_keys) == 0:
-            raise ValueError("No image observations found in env_obs.")
+        # Check if adapter has already processed the observations
+        if self.adapter is  None:
+            raise ValueError("Adapter not set")
 
-        images: list[torch.Tensor] = []
-        for key in image_keys:
-            image = env_obs[key]
-            if isinstance(image, np.ndarray):
-                image = torch.from_numpy(image)
-            elif not isinstance(image, torch.Tensor):
-                image = torch.as_tensor(image)
+        adapter_output = self.adapter.transform_input(env_obs)
 
-            if image.dim() == 3:
-                image = image.unsqueeze(0)
+        # Use pre-processed values from adapter
+        pixel_values = adapter_output["pixel_values"]
+        image_mask = adapter_output["image_mask"]
+        proprio = adapter_output["proprio"]
+        assert isinstance(pixel_values, torch.Tensor)
+        assert isinstance(image_mask, torch.Tensor)
+        assert isinstance(proprio, torch.Tensor)
+        batch_size = pixel_values.shape[0]
 
-            if image.dim() != 4:
-                raise ValueError(f"Expected image tensor with rank 4, got shape {tuple(image.shape)} for key '{key}'.")
-
-            if image.shape[-1] == 3:
-                image = image.permute(0, 3, 1, 2)
-
-            if image.shape[1] != 3:
-                raise ValueError(f"Expected 3 channels, got shape {tuple(image.shape)} for key '{key}'.")
-
-            images.append(image.float())
-
-        batch_size = images[0].shape[0]
-        pixel_values = torch.stack(images, dim=1)
-        image_mask = torch.ones(batch_size, pixel_values.shape[1], dtype=torch.bool, device=pixel_values.device)
-
-        total_views = getattr(self.config, "num_image_views", None) or pixel_values.shape[1]
-        total_views = max(total_views, pixel_values.shape[1])
-        if total_views > pixel_values.shape[1]:
-            pad_views = total_views - pixel_values.shape[1]
-            pad_images = pixel_values.new_zeros((batch_size, pad_views, *pixel_values.shape[2:]))
-            pad_mask = image_mask.new_zeros((batch_size, pad_views))
-            pixel_values = torch.cat([pixel_values, pad_images], dim=1)
-            image_mask = torch.cat([image_mask, pad_mask], dim=1)
-
-        if tuple(pixel_values.shape[-2:]) != (224, 224):
-            pixel_values = F.interpolate(
-                pixel_values.flatten(0, 1),
-                size=(224, 224),
-                mode="bilinear",
-                align_corners=False,
-            ).unflatten(0, (batch_size, pixel_values.shape[1]))
-
-        pixel_values = pixel_values.to(device=device, dtype=target_dtype)
-        image_mask = image_mask.to(device=device, dtype=torch.bool)
-
-        task_desc = env_obs.get("task_descriptions", "")
+        # Only tokenization and device transfer needed
+        task_desc = adapter_output.get("task_descriptions", "")
         if isinstance(task_desc, str):
             task_desc = [task_desc] * batch_size
         elif isinstance(task_desc, list):
@@ -844,21 +785,14 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         input_ids = tokenized.input_ids.to(device)
         attention_mask = tokenized.attention_mask.to(device)
 
-        state = env_obs.get("states")
-        proprio = self._prepare_proprio(
-            state,
-            batch_size=batch_size,
-            device=device,
-            dtype=target_dtype,
-        )
         domain_id = self._prepare_domain_id(env_obs.get("domain_id"), batch_size, device)
 
         return {
-            "pixel_values": pixel_values,
-            "image_mask": image_mask,
+            "pixel_values": pixel_values.to(device=device, dtype=target_dtype),
+            "image_mask": image_mask.to(device=device),
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "proprio": proprio,
+            "proprio": proprio.to(device=device, dtype=target_dtype),
             "domain_id": domain_id,
         }
     

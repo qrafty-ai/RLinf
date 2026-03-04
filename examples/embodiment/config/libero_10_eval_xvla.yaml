@@ -114,6 +114,9 @@ rollout:
   model:
     model_path: "lerobot/xvla-libero"
     precision: ${actor.model.precision}
+    xvla:
+      adapter:
+        simulator: "libero"
 
 actor:
   group_name: "ActorGroup"
@@ -127,6 +130,9 @@ actor:
     model_path: "lerobot/xvla-libero"
     model_type: "xvla"
     add_value_head: False
+    xvla:
+      adapter:
+        simulator: "libero"
 
   optim:
     lr: 5.0e-6

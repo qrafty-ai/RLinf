@@ -158,3 +158,20 @@ xvla:
     VISUAL: "IDENTITY"
     STATE: "IDENTITY"
     ACTION: "IDENTITY"
+
+  # Adapter configuration for environment-specific I/O transforms.
+  # The adapter applies simulator-specific preprocessing to observations and
+  # postprocessing to actions, enabling seamless deployment across different
+  # environments (e.g., LIBERO, ManiSkill) without model retraining.
+  # Set to null or omit to disable adapter (backward compatible).
+  adapter:
+    # Simulator profile to use (e.g., "libero", "maniskill")
+    # Set to null or omit to disable adapter (backward compatible)
+    simulator: null
+
+    # Optional: Override specific profile settings
+    # image:
+    #   resize: [256, 256]
+    # action:
+    #   gripper_range: [0, 1]
+
