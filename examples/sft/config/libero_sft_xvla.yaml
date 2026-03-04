@@ -36,6 +36,7 @@ hydra:
   output_subdir: null
   searchpath:
     - file://${oc.env:EMBODIED_PATH}/config/
+    - file://${oc.env:EMBODIED_PATH}/../embodiment/config/
 
 cluster:
   num_nodes: 1
@@ -56,7 +57,7 @@ runner:
   save_interval: 2000
 
 data:
-  train_data_paths: "/path/to/libero-data"
+  train_data_paths: "/home/cc/codes/RLinf/datasets/libero_10"
   num_workers: 4
 
 algorithm:

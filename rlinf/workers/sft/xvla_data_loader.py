@@ -14,9 +14,11 @@
 
 """Data loader for XVLA SFT training with LeRobot datasets."""
 
+import os
 from typing import Any, Optional
 
 import torch
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader, Dataset
 
@@ -30,7 +32,7 @@ class XVLADataLoader:
 
     def __init__(
         self,
-        data_paths: list[str],
+        data_paths: list[str] | str,
         batch_size: int,
         model_config: DictConfig,
         num_workers: int = 4,
@@ -38,60 +40,57 @@ class XVLADataLoader:
         """Initialize XVLA data loader.
 
         Args:
-            data_paths: List of paths to LeRobot datasets
+            data_paths: List of paths to LeRobot datasets or a single path/repo id
             batch_size: Batch size for training
             model_config: Model configuration containing XVLA settings
             num_workers: Number of data loading workers
         """
-        self.data_paths = data_paths
+        if isinstance(data_paths, str):
+            self.data_paths = [data_paths]
+        else:
+            self.data_paths = data_paths
         self.batch_size = batch_size
         self.model_config = model_config
         self.num_workers = num_workers
         self._data_iter = None
 
-        # Import LeRobot dependencies
-        try:
-            from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-            self.LeRobotDataset = LeRobotDataset
-        except ImportError as e:
-            raise ImportError(
-                "LeRobot is required for XVLA SFT. "
-                "Install with: pip install lerobot"
-            ) from e
-
         # Initialize dataset
         self.dataset = self._create_dataset()
         self.dataloader = self._create_dataloader()
 
-    def _create_dataset(self) -> Dataset:
+    def _create_dataset(self) -> Dataset[dict[str, Any]]:
         """Create LeRobot dataset from data paths."""
         if len(self.data_paths) == 0:
             raise ValueError("No data paths provided for XVLA SFT")
 
-        # Use first data path as the repo_id
         repo_id = self.data_paths[0]
+
+        if repo_id.startswith("/") and not os.path.exists(repo_id):
+            raise FileNotFoundError(
+                f"XVLA dataset path does not exist: {repo_id}. "
+                "Set data.train_data_paths to a valid local path or HuggingFace repo id."
+            )
 
         logger.info(f"Loading XVLA dataset from: {repo_id}")
 
-        # Get XVLA config
-        xvla_cfg = getattr(self.model_config, "xvla", self.model_config)
-        config_name = getattr(xvla_cfg, "config_name", "xvla_libero")
+        chunk_size = int(getattr(self.model_config, "num_action_chunks", 30))
 
         # Create dataset
-        dataset = self.LeRobotDataset(
+        dataset = LeRobotDataset(
             repo_id=repo_id,
             delta_timestamps={
-                "observation.image": [0.0],
-                "observation.wrist_image": [0.0],
+                "observation.images.image": [0.0],
+                "observation.images.wrist_image": [0.0],
                 "observation.state": [0.0],
-                "action": list(range(0, 32)),  # chunk_size = 32
+                "action": list(range(0, chunk_size)),
             },
+            video_backend="pyav",
         )
 
         logger.info(f"Loaded dataset with {len(dataset)} frames")
         return dataset
 
-    def _create_dataloader(self) -> DataLoader:
+    def _create_dataloader(self) -> DataLoader[dict[str, Any]]:
         """Create PyTorch DataLoader."""
         return DataLoader(
             self.dataset,
@@ -117,8 +116,15 @@ class XVLADataLoader:
             Tuple of (observation dict, actions tensor)
         """
         # Extract images
-        main_image = batch["observation.image"]  # [B, C, H, W]
-        wrist_image = batch.get("observation.wrist_image")
+        main_image = batch.get("observation.images.image", batch.get("observation.image"))
+        wrist_image = batch.get(
+            "observation.images.wrist_image", batch.get("observation.wrist_image")
+        )
+
+        if main_image is None:
+            raise KeyError(
+                "Missing image key in batch. Expected 'observation.images.image' or 'observation.image'."
+            )
 
         # Stack images: [B, V, C, H, W] where V is number of views
         if wrist_image is not None:
@@ -127,7 +133,9 @@ class XVLADataLoader:
             pixel_values = main_image.unsqueeze(1)  # [B, 1, C, H, W]
 
         # Extract proprioception (state)
-        proprio = batch.get("observation.state")  # [B, state_dim]
+        proprio = batch.get("observation.state")
+        if isinstance(proprio, torch.Tensor) and proprio.dim() == 3 and proprio.shape[1] == 1:
+            proprio = proprio.squeeze(1)
 
         # Extract task description (language instruction)
         task_descriptions = batch.get("task", [""] * pixel_values.shape[0])
@@ -150,7 +158,9 @@ class XVLADataLoader:
         }
 
         # Extract actions
-        actions = batch["action"]  # [B, chunk_size, action_dim]
+        actions = batch["action"]
+        if isinstance(actions, torch.Tensor) and actions.dim() == 2:
+            actions = actions.unsqueeze(1)
 
         return observation, actions
 
@@ -164,7 +174,7 @@ class XVLADataLoader:
 
 
 def create_xvla_data_loader(
-    data_paths: list[str],
+    data_paths: list[str] | str,
     batch_size: int,
     model_config: DictConfig,
     num_workers: int = 4,

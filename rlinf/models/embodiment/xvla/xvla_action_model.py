@@ -26,7 +26,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import BartTokenizerFast
+from transformers.models.bart import BartTokenizerFast
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.utils.logging import get_logger
@@ -298,6 +298,52 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
 
         return domain_id.to(dtype=torch.long)
 
+    def _prepare_proprio(
+        self,
+        proprio: Optional[torch.Tensor],
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if not self.use_proprio:
+            target_dim = max(1, int(getattr(self.config, "max_state_dim", 1)))
+            return torch.zeros((batch_size, target_dim), device=device, dtype=dtype)
+
+        target_dim = int(getattr(self.config, "max_state_dim", self.proprio_dim or 0))
+        if target_dim <= 0:
+            target_dim = max(1, int(self.proprio_dim) if self.proprio_dim else 1)
+
+        if proprio is None:
+            return torch.zeros((batch_size, target_dim), device=device, dtype=dtype)
+
+        if not isinstance(proprio, torch.Tensor):
+            proprio = torch.as_tensor(proprio, device=device, dtype=dtype)
+        else:
+            proprio = proprio.to(device=device, dtype=dtype)
+
+        if proprio.ndim == 1:
+            proprio = proprio.unsqueeze(0)
+        if proprio.ndim > 2:
+            proprio = proprio.reshape(proprio.shape[0], -1)
+
+        if proprio.shape[0] != batch_size:
+            if proprio.shape[0] == 1:
+                proprio = proprio.expand(batch_size, -1)
+            else:
+                proprio = proprio[:batch_size]
+
+        if proprio.shape[-1] < target_dim:
+            pad = torch.zeros(
+                (proprio.shape[0], target_dim - proprio.shape[-1]),
+                device=device,
+                dtype=dtype,
+            )
+            proprio = torch.cat([proprio, pad], dim=-1)
+        elif proprio.shape[-1] > target_dim:
+            proprio = proprio[..., :target_dim]
+
+        return proprio.contiguous()
+
     def _extract_env_state_dim(self, env_obs: dict[str, Any]) -> Optional[int]:
         """Best-effort extraction of state dimension from raw env observations."""
         state = env_obs.get("states")
@@ -373,6 +419,54 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
 
         pad_shape = (*action.shape[:-1], target_dim - action.shape[-1])
         return torch.cat([action, action.new_zeros(pad_shape)], dim=-1)
+
+    def _axis_angle_to_rotation_matrix(self, axis_angle: torch.Tensor) -> torch.Tensor:
+        batch_size = axis_angle.shape[0]
+        angle = torch.norm(axis_angle, dim=-1, keepdim=True)
+        mask = angle.squeeze(-1) > 1e-6
+        axis = axis_angle / (angle + 1e-8)
+
+        x = axis[:, 0]
+        y = axis[:, 1]
+        z = axis[:, 2]
+
+        k = torch.zeros(batch_size, 3, 3, dtype=axis_angle.dtype, device=axis_angle.device)
+        k[:, 0, 1] = -z
+        k[:, 0, 2] = y
+        k[:, 1, 0] = z
+        k[:, 1, 2] = -x
+        k[:, 2, 0] = -y
+        k[:, 2, 1] = x
+
+        eye = torch.eye(3, dtype=axis_angle.dtype, device=axis_angle.device).unsqueeze(0)
+        sin_angle = torch.sin(angle).unsqueeze(-1)
+        cos_angle = torch.cos(angle).unsqueeze(-1)
+        rot_mat = eye + sin_angle * k + (1 - cos_angle) * torch.bmm(k, k)
+
+        identity = eye.expand(batch_size, -1, -1)
+        return torch.where(mask.unsqueeze(-1).unsqueeze(-1), rot_mat, identity)
+
+    def _rotation_matrix_to_6d(self, rot_mat: torch.Tensor) -> torch.Tensor:
+        return rot_mat[:, :, :2].reshape(rot_mat.shape[0], 6)
+
+    def _convert_axis_angle_action_to_ee6d(self, action: torch.Tensor, target_dim: int) -> torch.Tensor:
+        if action.shape[-1] < 7:
+            return self._convert_action_to_target_dim(action, target_dim)
+
+        pos = action[..., :3]
+        axis_angle = action[..., 3:6]
+        gripper = action[..., 6:7]
+
+        flat_axis_angle = axis_angle.reshape(-1, 3)
+        rot_mat = self._axis_angle_to_rotation_matrix(flat_axis_angle)
+        rot6d = self._rotation_matrix_to_6d(rot_mat).reshape(*axis_angle.shape[:-1], 6)
+
+        first_arm = torch.cat([pos, rot6d, gripper], dim=-1)
+        if target_dim <= 10:
+            return self._convert_action_to_target_dim(first_arm, target_dim)
+
+        pad_shape = (*first_arm.shape[:-1], target_dim - 10)
+        return torch.cat([first_arm, first_arm.new_zeros(pad_shape)], dim=-1)
     
     @property
     def _no_split_modules(self) -> list[str]:
@@ -503,6 +597,27 @@ class XVLAForRLActionPrediction(nn.Module, BasePolicy):
         domain_id = self._prepare_domain_id(observations.get("domain_id"), batch_size, actions.device)
 
         action_target = actions.to(dtype=target_dtype)
+        if action_target.ndim == 2:
+            action_target = action_target.unsqueeze(1)
+
+        if action_target.shape[1] != self.chunk_size:
+            if action_target.shape[1] > self.chunk_size:
+                action_target = action_target[:, : self.chunk_size]
+            else:
+                pad_shape = (
+                    action_target.shape[0],
+                    self.chunk_size - action_target.shape[1],
+                    action_target.shape[2],
+                )
+                action_target = torch.cat([action_target, action_target.new_zeros(pad_shape)], dim=1)
+
+        if action_target.shape[-1] != self.dim_action:
+            action_space_name = str(getattr(self.action_space, "name", "")).lower()
+            if action_space_name in {"ee6d", "agibot_ee6d"} and action_target.shape[-1] == 7:
+                action_target = self._convert_axis_angle_action_to_ee6d(action_target, self.dim_action)
+            else:
+                action_target = self._convert_action_to_target_dim(action_target, self.dim_action)
+
         loss_dict = self._xvla_model(
             input_ids=cast(torch.LongTensor, input_ids.to(dtype=torch.long)),
             image_input=cast(torch.FloatTensor, pixel_values),

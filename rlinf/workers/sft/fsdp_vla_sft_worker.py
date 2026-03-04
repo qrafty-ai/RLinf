@@ -70,20 +70,33 @@ class FSDPVlaSftWorker(FSDPSftWorker):
         observation, actions = next(self.data_iter)
 
         register_pytree_dataclasses(observation)
+
+        def _to_device_tensor_if_possible(x: Any) -> Any:
+            try:
+                return torch.as_tensor(x, device=self.device).contiguous().clone()
+            except (TypeError, ValueError):
+                return x
+
         observation = _pytree.tree_map(
-            lambda x: torch.as_tensor(x, device=self.device).contiguous().clone()
-            if x is not None
-            else x,
+            lambda x: _to_device_tensor_if_possible(x) if x is not None else x,
             observation,
         )
         actions = actions.to(torch.float32)
         actions = actions.to(self.device)
 
         with self.amp_context:
-            losses = self.model(
+            outputs = self.model(
                 forward_type=ForwardType.SFT,
-                data={"observation": observation, "actions": actions},
+                data={"observations": observation, "actions": actions},
             )
 
-        # train model return the loss
-        return losses
+        if isinstance(outputs, dict):
+            loss = outputs.get("loss")
+            if not isinstance(loss, torch.Tensor):
+                raise TypeError("XVLA SFT forward must return a tensor loss in outputs['loss']")
+            return loss
+
+        if isinstance(outputs, torch.Tensor):
+            return outputs
+
+        raise TypeError(f"Unexpected XVLA SFT output type: {type(outputs)!r}")

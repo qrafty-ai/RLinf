@@ -207,19 +207,16 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False, model_type=None):
         transformer_cls_to_wrap = set()
         for layer_class in fsdp_transformer_layer_cls_to_wrap:
             transformer_cls = get_module_class_from_name(module, layer_class)
-            if transformer_cls is None:
-                raise Exception(
-                    "Could not find the transformer layer class to wrap in the model."
-                )
-            else:
+            if transformer_cls is not None:
                 transformer_cls_to_wrap.add(transformer_cls)
 
-        llm_wrap_policy = functools.partial(
-            transformer_auto_wrap_policy,
-            # Transformer layer class to wrap
-            transformer_layer_cls=transformer_cls_to_wrap,
-        )
-        policies.append(llm_wrap_policy)
+        if len(transformer_cls_to_wrap) > 0:
+            llm_wrap_policy = functools.partial(
+                transformer_auto_wrap_policy,
+                # Transformer layer class to wrap
+                transformer_layer_cls=transformer_cls_to_wrap,
+            )
+            policies.append(llm_wrap_policy)
 
     if hasattr(module, "_no_split_names"):
         no_split_names = getattr(module, "_no_split_names", None)

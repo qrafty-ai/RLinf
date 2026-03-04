@@ -25,9 +25,14 @@ set -e
 
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 # Config name (default to libero_sft_xvla if not provided)
 CONFIG_NAME="${1:-libero_sft_xvla}"
+if [ "$#" -gt 0 ]; then
+  shift
+fi
+EXTRA_ARGS=("$@")
 
 echo "========================================"
 echo "XVLA SFT Training"
@@ -40,6 +45,11 @@ echo ""
 export EMBODIED_PATH="${SCRIPT_DIR}"
 export PYTHONPATH="${SCRIPT_DIR}/../..:${PYTHONPATH}"
 
+PYTHON_BIN="python"
+if ! "${PYTHON_BIN}" -c "import hydra" >/dev/null 2>&1 && [ -x "${REPO_ROOT}/.venv/bin/python" ]; then
+    PYTHON_BIN="${REPO_ROOT}/.venv/bin/python"
+fi
+
 # Optional: Set CUDA devices
 # export CUDA_VISIBLE_DEVICES=0
 
@@ -47,9 +57,10 @@ echo "Starting SFT training..."
 echo ""
 
 # Run the training script
-python "${SCRIPT_DIR}/train_vla_sft.py" \
+"${PYTHON_BIN}" "${SCRIPT_DIR}/train_vla_sft.py" \
     --config-name "${CONFIG_NAME}" \
-    --config-dir "${SCRIPT_DIR}/config"
+    --config-dir "${SCRIPT_DIR}/config" \
+    "${EXTRA_ARGS[@]}"
 
 echo ""
 echo "Training completed!"

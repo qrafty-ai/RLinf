@@ -551,7 +551,8 @@ install_xvla_model() {
     echo "Installing XVLA dependencies..."
     # Florence2 is available in transformers>=4.45.0
     # Current RLinf uses 4.51.1 which already supports it
-    uv pip install transformers>=4.45.0 safetensors einops
+    uv pip install "transformers>=4.45.0" safetensors einops
+    uv pip install --no-deps "lerobot>=0.4.3"
 
     # Flash attention for efficient training
     install_flash_attn
