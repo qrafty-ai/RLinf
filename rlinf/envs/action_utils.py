@@ -74,6 +74,10 @@ def prepare_actions_for_libero(
     ]:
         chunk_actions[..., -1] = 2 * chunk_actions[..., -1] - 1
         chunk_actions[..., -1] = np.sign(chunk_actions[..., -1]) * -1.0
+    elif SupportedModel(model_type) == SupportedModel.XVLA:
+        # XVLA adapter already handles gripper conversion to {-1, 1}
+        # No additional processing needed
+        pass
     return chunk_actions
 
 

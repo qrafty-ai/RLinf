@@ -84,19 +84,19 @@ env:
   group_name: "EnvGroup"
 
   train:
-    total_num_envs: 2  # Required for rollout worker initialization
+    total_num_envs: 1  # Required for rollout worker initialization
     reward_coef: ${algorithm.reward_coef}
     group_size: ${algorithm.group_size}
-    max_episode_steps: 96
-    max_steps_per_rollout_epoch: 96
+    max_episode_steps: 90
+    max_steps_per_rollout_epoch: 90
 
   eval:
-    total_num_envs: 2  # Very small for quick test - must be multiple of group_size
+    total_num_envs: 1  # Very small for quick test - must be multiple of group_size
     auto_reset: True
     ignore_terminations: True
-    group_size: 2
-    max_episode_steps: 96  # Must be divisible by num_action_chunks (32)
-    max_steps_per_rollout_epoch: 96
+    group_size: 1
+    max_episode_steps: 90
+    max_steps_per_rollout_epoch: 90
     use_fixed_reset_state_ids: True
     use_ordered_reset_state_ids: True
     reset_gripper_open: False

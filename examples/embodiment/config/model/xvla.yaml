@@ -29,7 +29,8 @@ model_path: "/path/to/model/xvla"
 precision: "bf16"  # bf16 or float32
 
 # Action settings
-num_action_chunks: 32
+# Note: Must match the checkpoint's chunk_size. XVLA-libero checkpoint uses 30.
+num_action_chunks: 30
 action_dim: 7
 
 # LoRA (typically not used with XVLA since we freeze VLM)
@@ -126,7 +127,8 @@ xvla:
   # Action space
   action_mode: "ee6d"  # LeRobot/XVLA packed ee6d action format
   max_action_dim: 20
-  n_action_steps: 32
+  # Note: Must match chunk_size. XVLA-libero checkpoint uses 30.
+  n_action_steps: 30
   
   # Observation settings
   num_images_in_input: 2
