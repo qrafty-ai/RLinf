@@ -1,0 +1,179 @@
+# Copyright 2025 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# XVLA model configuration YAML.
+#
+# This config defines the XVLA (Flow-Matching Vision-Language-Action) model
+# with Florence2 backbone and SoftPromptedTransformer policy head.
+#
+# Based on LeRobot's XVLA implementation:
+# https://github.com/huggingface/lerobot
+
+model_type: "xvla"
+
+# Model path - should be set in specific config files
+model_path: "/path/to/model/xvla"
+
+# Precision for model weights
+precision: "bf16"  # bf16 or float32
+
+# Action settings
+# Note: Must match the checkpoint's chunk_size. XVLA-libero checkpoint uses 30.
+num_action_chunks: 30
+action_dim: 7
+
+# LoRA (typically not used with XVLA since we freeze VLM)
+is_lora: False
+lora_rank: 32
+
+# ============================================================================
+# XVLA-Specific Configuration
+# ============================================================================
+xvla:
+  # Model identification
+  config_name: "xvla_libero"  # xvla_libero, xvla_maniskill, etc.
+  
+  # Florence2 backbone configuration
+  florence_config:
+    vision_config:
+      # DaViT vision encoder settings
+      drop_path_rate: 0.1
+      patch_size: [7, 3, 3, 3]
+      patch_stride: [4, 2, 2, 2]
+      patch_padding: [3, 1, 1, 1]
+      patch_prenorm: [false, true, true, true]
+      dim_embed: [256, 512, 1024, 2048]
+      num_heads: [8, 16, 32, 64]
+      num_groups: [8, 16, 32, 64]
+      depths: [1, 1, 9, 1]
+      window_size: 12
+      projection_dim: 1024
+      visual_temporal_embedding:
+        type: "COSINE"
+        max_temporal_embeddings: 100
+      image_pos_embed:
+        type: "learned_abs_2d"
+        max_pos_embeddings: 1000
+      image_feature_source: ["spatial_avg_pool", "temporal_avg_pool"]
+      enable_checkpoint: false
+    
+    text_config:
+      # BART language model settings
+      vocab_size: 51289
+      d_model: 1024
+      max_position_embeddings: 1024
+      encoder_layers: 12
+      encoder_ffn_dim: 4096
+      encoder_attention_heads: 16
+      encoder_layerdrop: 0.0
+      decoder_layers: 12
+      decoder_layerdrop: 0.0
+      _attn_implementation: "eager"
+      decoder_ffn_dim: 4096
+      decoder_attention_heads: 16
+      dropout: 0.1
+      attention_dropout: 0.0
+      activation_dropout: 0.0
+      activation_function: "gelu"
+      init_std: 0.02
+      scale_embedding: false
+      use_cache: true
+      pad_token_id: 1
+      bos_token_id: 0
+      eos_token_id: 2
+      is_encoder_decoder: true
+    
+    projection_dim: 1024
+    ignore_index: -100
+    vocab_size: 51289
+  
+  # Tokenizer configuration
+  tokenizer_name: "facebook/bart-base"
+  tokenizer_max_length: 96
+  tokenizer_padding_side: "right"
+  pad_language_to: "max_length"
+  domain_id: 3 # libero
+  
+  # SoftPromptedTransformer policy head
+  hidden_size: 1024
+  depth: 24
+  num_heads: 16
+  mlp_ratio: 4.0
+  num_domains: 30
+  len_soft_prompts: 32
+  dim_time: 32
+  max_len_seq: 512
+  use_hetero_proj: false
+  
+  # Flow-matching configuration
+  noise_method: "flow_matching"  # flow_matching, flow_sde, consistency_model
+  num_steps: 10  # Number of denoising steps
+  sigma_min: 0.001
+  sigma_max: 1.0
+  rho: 7.0
+  time_schedule: "lognorm"  # lognorm, uniform, cosine
+  
+  # Action space
+  action_mode: "ee6d"  # LeRobot/XVLA packed ee6d action format
+  max_action_dim: 20
+  # Note: Must match chunk_size. XVLA-libero checkpoint uses 30.
+  n_action_steps: 30
+  
+  # Observation settings
+  num_images_in_input: 2
+  use_proprio: true
+  max_state_dim: 20
+  num_image_views: null
+  empty_cameras: 0
+  resize_imgs_with_padding: null
+  domain_feature_key: null
+  
+  # Model dtype
+  dtype: "bfloat16"
+  
+  # Freezing options (VLM frozen by default, train only policy head)
+  freeze_vision_encoder: true
+  freeze_language_encoder: true
+  train_policy_transformer: true
+  train_soft_prompts: true
+  
+  # RL-specific settings
+  add_value_head: false
+  value_after_vlm: false
+  value_vlm_mode: "mean_token"  # last_token, mean_token, first_token
+  detach_critic_input: false
+  chunk_critic_input: false
+  
+  # Normalization settings
+  normalization_mapping:
+    VISUAL: "IDENTITY"
+    STATE: "IDENTITY"
+    ACTION: "IDENTITY"
+
+  # Adapter configuration for environment-specific I/O transforms.
+  # The adapter applies simulator-specific preprocessing to observations and
+  # postprocessing to actions, enabling seamless deployment across different
+  # environments (e.g., LIBERO, ManiSkill) without model retraining.
+  # Set to null or omit to disable adapter (backward compatible).
+  adapter:
+    # Simulator profile to use (e.g., "libero", "maniskill")
+    # Set to null or omit to disable adapter (backward compatible)
+    simulator: null
+
+    # Optional: Override specific profile settings
+    # image:
+    #   resize: [256, 256]
+    # action:
+    #   gripper_range: [0, 1]
+

@@ -28,7 +28,9 @@ class FSDPVlaSftWorker(FSDPSftWorker):
         super().__init__(cfg)
 
     def build_dataloader(self, data_paths: list[str], eval_dataset: bool = False):
-        if SupportedModel(self.cfg.actor.model.model_type) in [SupportedModel.OPENPI]:
+        model_type = SupportedModel(self.cfg.actor.model.model_type)
+
+        if model_type == SupportedModel.OPENPI:
             import openpi.training.data_loader as openpi_data_loader
 
             from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
@@ -42,6 +44,19 @@ class FSDPVlaSftWorker(FSDPSftWorker):
                 config, framework="pytorch", shuffle=True
             )
             return data_loader, data_loader.data_config()
+
+        elif model_type == SupportedModel.XVLA:
+            # XVLA uses LeRobot dataset format
+            from rlinf.workers.sft.xvla_data_loader import create_xvla_data_loader
+
+            data_loader = create_xvla_data_loader(
+                data_paths=data_paths,
+                batch_size=self.cfg.actor.micro_batch_size * self._world_size,
+                model_config=self.cfg.actor.model,
+                num_workers=getattr(self.cfg.data, "num_workers", 4),
+            )
+            return data_loader, None
+
         else:
             raise KeyError(
                 f"not support such model type {self.cfg.actor.model.model_type} for SFT right now."
@@ -55,20 +70,33 @@ class FSDPVlaSftWorker(FSDPSftWorker):
         observation, actions = next(self.data_iter)
 
         register_pytree_dataclasses(observation)
+
+        def _to_device_tensor_if_possible(x: Any) -> Any:
+            try:
+                return torch.as_tensor(x, device=self.device).contiguous().clone()
+            except (TypeError, ValueError):
+                return x
+
         observation = _pytree.tree_map(
-            lambda x: torch.as_tensor(x, device=self.device).contiguous().clone()
-            if x is not None
-            else x,
+            lambda x: _to_device_tensor_if_possible(x) if x is not None else x,
             observation,
         )
         actions = actions.to(torch.float32)
         actions = actions.to(self.device)
 
         with self.amp_context:
-            losses = self.model(
+            outputs = self.model(
                 forward_type=ForwardType.SFT,
-                data={"observation": observation, "actions": actions},
+                data={"observations": observation, "actions": actions},
             )
 
-        # train model return the loss
-        return losses
+        if isinstance(outputs, dict):
+            loss = outputs.get("loss")
+            if not isinstance(loss, torch.Tensor):
+                raise TypeError("XVLA SFT forward must return a tensor loss in outputs['loss']")
+            return loss
+
+        if isinstance(outputs, torch.Tensor):
+            return outputs
+
+        raise TypeError(f"Unexpected XVLA SFT output type: {type(outputs)!r}")

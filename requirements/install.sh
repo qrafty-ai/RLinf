@@ -17,7 +17,7 @@ GITHUB_PREFIX=""
 NO_ROOT=0
 NO_INSTALL_RLINF_CMD="--no-install-project"
 SUPPORTED_TARGETS=("embodied" "agentic" "docs")
-SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "gr00t" "dexbotic")
+SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "gr00t" "dexbotic" "xvla")
 SUPPORTED_ENVS=("behavior" "maniskill_libero" "metaworld" "calvin" "isaaclab" "robocasa" "franka" "frankasim" "robotwin" "habitat" "opensora" "wan")
 
 #=======================Utility Functions=======================
@@ -533,6 +533,35 @@ install_dexbotic_model() {
     uv pip uninstall pynvml || true
 }
 
+install_xvla_model() {
+    create_and_sync_venv
+    install_common_embodied_deps
+
+    case "$ENV_NAME" in
+        maniskill_libero)
+            install_maniskill_libero_env
+            ;;
+        *)
+            echo "Environment '$ENV_NAME' is not supported for XVLA model." >&2
+            exit 1
+            ;;
+    esac
+
+    # Install XVLA dependencies
+    echo "Installing XVLA dependencies..."
+    # Florence2 is available in transformers>=4.45.0
+    # Current RLinf uses 4.51.1 which already supports it
+    uv pip install "transformers>=4.45.0" safetensors einops
+    uv pip install --no-deps "lerobot>=0.4.3"
+    # Rotation/transform conversions (axis-angle, 6D, etc.)
+    uv pip install git+https://github.com/junhaotu2000/uni-transform
+
+    # Flash attention for efficient training
+    install_flash_attn
+
+    uv pip uninstall pynvml || true
+}
+
 install_env_only() {
     create_and_sync_venv
     SKIP_ROS=${SKIP_ROS:-0}
@@ -857,6 +886,9 @@ main() {
                     ;;
                 dexbotic)
                     install_dexbotic_model
+                    ;;
+                xvla)
+                    install_xvla_model
                     ;;
                 "")
                     install_env_only
