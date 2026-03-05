@@ -23,3 +23,6 @@ PKG-INFO
 .pixi/*
 !.pixi/config.toml
 pixi.lock
+*.pkl
+datasets/
+.opencode

@@ -18,36 +18,13 @@ Uses lerobot's XVLA implementation directly for checkpoint compatibility.
 """
 
 import torch
-from typing import Optional
 
-from omegaconf import DictConfig
+from rlinf.models.embodiment.xvla.xvla_action_model import (
+    XVLAForRLActionPrediction,
+    build_xvla_io_config,
+)
 
-from rlinf.models.embodiment.xvla.adapter import XVLAAdapter
-from rlinf.models.embodiment.xvla.xvla_action_model import XVLAForRLActionPrediction
-
-__all__ = ["XVLAForRLActionPrediction", "get_model", "create_xvla_adapter"]
-
-
-def create_xvla_adapter(config: DictConfig) -> Optional[XVLAAdapter]:
-    """Create XVLA adapter from Hydra config.
-    
-    Args:
-        config: DictConfig with optional 'adapter' key containing:
-            - simulator: str - Required simulator name (e.g., "libero")
-            - Other optional overrides
-            
-    Returns:
-        XVLAAdapter instance or None if adapter config is not provided
-    """
-    if not hasattr(config, 'adapter') or config.adapter is None:
-        return None
-    
-    simulator = config.adapter.get('simulator')
-    if simulator is None:
-        return None
-    
-    overrides = {k: v for k, v in config.adapter.items() if k != 'simulator'}
-    return XVLAAdapter(simulator, overrides if overrides else None)
+__all__ = ["XVLAForRLActionPrediction", "get_model"]
 
 
 def get_model(cfg, torch_dtype=None) -> XVLAForRLActionPrediction:
@@ -126,13 +103,14 @@ def get_model(cfg, torch_dtype=None) -> XVLAForRLActionPrediction:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     lerobot_policy = lerobot_policy.to(device).eval()
 
-    adapter = create_xvla_adapter(xvla_cfg)
+    adapter_cfg = getattr(xvla_cfg, "adapter", None)
+    io_config = build_xvla_io_config(adapter_cfg)
 
     model = XVLAForRLActionPrediction.from_lerobot_policy(
         lerobot_policy=lerobot_policy,
         config_name=config_name,
         add_value_head=getattr(xvla_cfg, "add_value_head", False),
-        adapter=adapter,
+        io_config=io_config,
     )
 
     override_tokenizer_max_length = getattr(xvla_cfg, "tokenizer_max_length", None)

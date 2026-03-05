@@ -553,6 +553,8 @@ install_xvla_model() {
     # Current RLinf uses 4.51.1 which already supports it
     uv pip install "transformers>=4.45.0" safetensors einops
     uv pip install --no-deps "lerobot>=0.4.3"
+    # Rotation/transform conversions (axis-angle, 6D, etc.)
+    uv pip install git+https://github.com/junhaotu2000/uni-transform
 
     # Flash attention for efficient training
     install_flash_attn
